@@ -1025,13 +1025,36 @@
     if(e.key === "Enter"){ handleScanResult(this.value); }
   });
 
-  /* ================= CAMERA SCAN (Quagga2 — tuned for 1D retail barcodes: EAN/Code128/UPC) ================= */
+  /* ================= CAMERA SCAN (Quagga2 — tuned for 1D retail barcodes: EAN/Code128) ================= */
   var quaggaRunning = false;
   var CONTINUOUS_COOLDOWN_MS = 1400; // ignore repeat frames of the same raw code within this window
+  var scanBuffer = [];          // rolling window of borderline reads, used only as a light fallback check
+  var SCAN_BUFFER_SIZE = 3;
+  var SCAN_CONSENSUS_COUNT = 2; // fallback: accept if the same borderline code repeats this many times
+  var GOOD_ERROR_THRESHOLD = 0.12; // Quagga per-bar decode error — low enough to trust on the first read
+
+  function avgDecodeError(result){
+    var codes = result && result.codeResult && result.codeResult.decodedCodes;
+    if(!codes || !codes.length) return 1;
+    var errs = [];
+    codes.forEach(function(c){ if(typeof c.error === "number") errs.push(c.error); });
+    if(!errs.length) return 1;
+    return errs.reduce(function(a,b){ return a+b; }, 0) / errs.length;
+  }
 
   function onQuaggaDetected(result){
     var code = result && result.codeResult && result.codeResult.code;
     if(!code) return;
+
+    var err = avgDecodeError(result);
+    if(err > GOOD_ERROR_THRESHOLD){
+      // Low-confidence single read — only accept if the same value repeats shortly after.
+      scanBuffer.push(code);
+      if(scanBuffer.length > SCAN_BUFFER_SIZE) scanBuffer.shift();
+      var agree = scanBuffer.filter(function(c){ return c === code; }).length;
+      if(agree < SCAN_CONSENSUS_COUNT) return;
+    }
+    scanBuffer = [];
 
     if(state.continuousMode){
       var now = Date.now();
@@ -1170,6 +1193,7 @@
     $("camWrap").classList.remove("hide");
     $("btnCloseCam").classList.remove("hide");
     $("scanIdle").classList.add("hide");
+    scanBuffer = [];
 
     Quagga.init({
       inputStream: {
@@ -1183,7 +1207,7 @@
         area: { top: "20%", right: "8%", left: "8%", bottom: "20%" }
       },
       decoder: {
-        readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader","code_39_reader"]
+        readers: ["ean_reader","ean_8_reader","code_128_reader"]
       },
       locate: true,
       locator: { patchSize: "medium", halfSample: true },
