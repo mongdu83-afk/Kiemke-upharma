@@ -190,6 +190,26 @@
   .sr-detail.open{display:block;}
   .sr-detail div{display:flex; justify-content:space-between; padding:2px 0;}
 
+  .mode-row{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px;}
+  .mode-row .mt{font-weight:700; font-size:13.5px;}
+  .mode-row .ms{font-size:11.5px; color:var(--ink-soft); margin-top:2px;}
+  .switch{position:relative; display:inline-block; width:46px; height:27px; flex-shrink:0;}
+  .switch input{opacity:0; width:0; height:0;}
+  .switch-slider{position:absolute; cursor:pointer; inset:0; background:#ccd9d5; border-radius:999px; transition:.15s;}
+  .switch-slider:before{position:absolute; content:""; height:21px; width:21px; left:3px; bottom:3px; background:#fff; border-radius:50%; transition:.15s;}
+  .switch input:checked + .switch-slider{background:var(--teal);}
+  .switch input:checked + .switch-slider:before{transform:translateX(19px);}
+
+  .recent-row{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 0; border-bottom:1px solid var(--line);}
+  .recent-row:last-child{border-bottom:none;}
+  .recent-row .rn{font-weight:700; font-size:13px; line-height:1.3;}
+  .recent-row .rc{font-family:var(--mono); font-size:10.5px; color:var(--ink-soft);}
+  .recent-row .rq{font-weight:800; font-size:16px; color:var(--teal-deep); min-width:34px; text-align:center;}
+  .recent-actions{display:flex; gap:6px; flex-shrink:0;}
+  .recent-actions button{border:1.5px solid var(--line); background:#fff; border-radius:8px; padding:6px 9px; font-size:11.5px; font-weight:700; color:var(--ink-soft);}
+  .recent-edit{display:flex; gap:6px; align-items:center; flex-shrink:0;}
+  .recent-edit input{width:56px; padding:6px 4px; text-align:center; font-size:14px;}
+
   .empty{text-align:center; padding:40px 16px; color:var(--ink-soft);}
   .empty .em-icon{font-size:34px; margin-bottom:8px;}
 
@@ -258,6 +278,20 @@
     </div>
   </div>
 
+  <!-- ============ MANAGER PIN GATE ============ -->
+  <div id="pinGate" class="gate hide">
+    <div class="gate-card card">
+      <div class="mark">Upharma</div>
+      <h1>Khu vực quản lý</h1>
+      <p>Nhập mã PIN quản lý để xem Tổng hợp / Cài đặt</p>
+      <div class="stack">
+        <input type="password" id="pinInput" placeholder="Mã PIN" inputmode="numeric" autocomplete="off">
+        <button class="btn btn-primary" id="pinSubmit">Xác nhận</button>
+        <button class="btn btn-ghost" id="pinCancel">Huỷ, quay lại Kiểm kê</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ============ TOP BAR ============ -->
   <div class="topbar">
     <div class="topbar-row">
@@ -274,6 +308,17 @@
 
   <!-- ============ VIEW: SCAN ============ -->
   <div id="view-scan" class="view">
+
+    <div class="card mode-row" style="padding:0 16px;">
+      <div>
+        <div class="mt">Chế độ quét liên tục</div>
+        <div class="ms">Mỗi lần quét tự ghi nhận SL = 1, không cần xác nhận từng lần</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="continuousToggle">
+        <span class="switch-slider"></span>
+      </label>
+    </div>
 
     <div id="scanIdle" class="card" style="padding:0; overflow:hidden;">
       <div class="scan-launch">
@@ -292,6 +337,12 @@
       <div class="cam-hint">Đưa mã vạch vào khung hình</div>
     </div>
     <button class="btn btn-ghost hide" id="btnCloseCam" style="margin-bottom:14px;">Đóng camera</button>
+
+    <div id="recentFeed" class="card hide">
+      <h2>Vừa ghi nhận</h2>
+      <p class="sub">Bấm Sửa nếu lỡ điền sai số lượng, hoặc Xoá nếu ghi nhận nhầm.</p>
+      <div id="recentList"></div>
+    </div>
 
     <div class="divider-or">HOẶC NHẬP MÃ TAY</div>
 
@@ -399,6 +450,7 @@
       <h2 style="color:var(--teal-deep);">Ghi chú sử dụng</h2>
       <p class="sub" style="color:var(--teal-deep);">
         • Quét mã hoạt động trên cả iPhone (Safari) và Android (Chrome) — lần đầu mở camera trình duyệt sẽ xin quyền, bấm Cho phép.<br>
+        • Tab Tổng hợp và Cài đặt cần mã PIN quản lý để vào, tránh nhân viên xem tồn hệ thống hoặc tự sửa dữ liệu.<br>
         • Ứng dụng đối chiếu 5 số đầu của mã quét với 5 số cuối của mã trong file tồn để định danh sản phẩm.<br>
         • Nhiều người có thể kiểm cùng lúc trên cùng cửa hàng — kết quả tự cộng dồn ở mục Tổng hợp.
       </p>
@@ -454,6 +506,10 @@
     stockRaw: null,       // parsed sheet rows for column mapping
     currentMatch: null,   // matched product object
     candidates: [],
+    chooserContext: "manual", // "manual" | "continuous"
+    continuousMode: false,
+    lastCodeTime: {},     // raw scanned code -> ts, debounce repeat frames
+    recentScans: [],      // [{product, entry}] most recent first, continuous-mode feed
     summaryFilter: "all",
     entriesCache: {}      // code -> entries array (for current summary render)
   };
@@ -611,10 +667,51 @@
     $("curUserLine").textContent = state.user + " · cửa hàng " + state.shop;
   }
   $("ctxChip").addEventListener("click", function(){
-    switchView("settings");
+    requestManagerAccess("settings");
   });
   $("btnChangeUser").addEventListener("click", function(){
     $("gate").classList.remove("hide");
+  });
+
+  /* ================= CONTINUOUS SCAN MODE TOGGLE ================= */
+  state.continuousMode = localStorage.getItem("kiemke_continuous") === "1";
+  $("continuousToggle").checked = state.continuousMode;
+  $("continuousToggle").addEventListener("change", function(){
+    state.continuousMode = this.checked;
+    localStorage.setItem("kiemke_continuous", state.continuousMode ? "1" : "0");
+    toast(state.continuousMode ? "Đã bật quét liên tục — mỗi lần quét tự ghi SL = 1" : "Đã tắt quét liên tục", 2200);
+  });
+
+  /* ================= MANAGER PIN GATE (deterrent-level access control for Tổng hợp / Cài đặt) ================= */
+  var MANAGER_PIN = "2026"; // Đổi mã này trước khi tải file lên nếu muốn dùng PIN khác
+  state.managerUnlocked = sessionStorage.getItem("kiemke_mgr_unlocked") === "1";
+  state.pendingView = null;
+
+  function requestManagerAccess(targetView){
+    if(state.managerUnlocked){
+      switchView(targetView);
+      return;
+    }
+    state.pendingView = targetView;
+    $("pinInput").value = "";
+    $("pinGate").classList.remove("hide");
+    setTimeout(function(){ $("pinInput").focus(); }, 60);
+  }
+  $("pinSubmit").addEventListener("click", function(){
+    if($("pinInput").value.trim() === MANAGER_PIN){
+      state.managerUnlocked = true;
+      sessionStorage.setItem("kiemke_mgr_unlocked", "1");
+      $("pinGate").classList.add("hide");
+      switchView(state.pendingView || "summary");
+    } else {
+      toast("Mã PIN không đúng");
+    }
+  });
+  $("pinCancel").addEventListener("click", function(){
+    $("pinGate").classList.add("hide");
+  });
+  $("pinInput").addEventListener("keydown", function(e){
+    if(e.key === "Enter") $("pinSubmit").click();
   });
 
   /* ================= NAV ================= */
@@ -628,7 +725,14 @@
     if(name==="summary"){ renderSummary(); }
   }
   document.querySelectorAll(".nav-btn").forEach(function(b){
-    b.addEventListener("click", function(){ switchView(b.dataset.view); });
+    b.addEventListener("click", function(){
+      var v = b.dataset.view;
+      if(v === "summary" || v === "settings"){
+        requestManagerAccess(v);
+      } else {
+        switchView(v);
+      }
+    });
   });
 
   /* ================= STOCK LOAD ================= */
@@ -782,18 +886,34 @@
     } else if(matches.length === 1){
       await showProductCard(matches[0]);
     } else {
-      state.candidates = matches;
-      $("matchChooser").classList.remove("hide");
-      $("matchList").innerHTML = matches.slice(0,20).map(function(m,i){
-        return '<div class="match-item" data-i="'+i+'">' +
-          '<div><div class="mi-name">'+escapeHtml(m.name)+'</div><div class="mi-code">'+escapeHtml(m.code)+' · '+escapeHtml(m.unit)+'</div></div>' +
-          '<button class="btn btn-outline btn-sm" data-pick="'+i+'">Chọn</button></div>';
-      }).join("");
-      document.querySelectorAll("[data-pick]").forEach(function(btn){
-        btn.addEventListener("click", function(){
-          showProductCard(state.candidates[parseInt(this.dataset.pick,10)]);
-        });
+      showChooser(matches, "manual");
+    }
+  }
+
+  function showChooser(matches, context){
+    state.candidates = matches;
+    state.chooserContext = context || "manual";
+    $("matchChooser").classList.remove("hide");
+    $("matchList").innerHTML = matches.slice(0,20).map(function(m,i){
+      return '<div class="match-item" data-i="'+i+'">' +
+        '<div><div class="mi-name">'+escapeHtml(m.name)+'</div><div class="mi-code">'+escapeHtml(m.code)+' · '+escapeHtml(m.unit)+'</div></div>' +
+        '<button class="btn btn-outline btn-sm" data-pick="'+i+'">Chọn</button></div>';
+    }).join("");
+    document.querySelectorAll("[data-pick]").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        handleChooserPick(parseInt(this.dataset.pick,10));
       });
+    });
+  }
+
+  function handleChooserPick(idx){
+    var prod = state.candidates[idx];
+    $("matchChooser").classList.add("hide");
+    if(state.chooserContext === "continuous"){
+      autoRecord(prod);
+      try{ if(quaggaRunning) Quagga.start(); }catch(e){}
+    } else {
+      showProductCard(prod);
     }
   }
 
@@ -868,10 +988,6 @@
   });
 
   /* ================= ENTRIES (shared, per product — backed by Firestore) ================= */
-  async function addEntry(code, qty, note){
-    var entry = {user: state.user, qty: Number(qty), note: note||"", ts: Date.now()};
-    await addEntryFs(state.shop, code, entry);
-  }
   async function getIndex(){
     return await getIndexFs(state.shop);
   }
@@ -883,7 +999,9 @@
     this.disabled = true;
     this.textContent = "Đang lưu...";
     try{
-      await addEntry(state.currentMatch.code, qty, $("pcNote").value.trim());
+      var entry = {user: state.user, qty: Number(qty), note: $("pcNote").value.trim(), ts: Date.now()};
+      await addEntryFs(state.shop, state.currentMatch.code, entry);
+      pushRecentScan(state.currentMatch, entry);
       toast("Đã ghi nhận " + fmtNum(qty) + " " + (state.currentMatch.unit||"") + " — " + state.currentMatch.name);
       hideAllResultBlocks();
       $("manualCode").value = "";
@@ -909,13 +1027,139 @@
 
   /* ================= CAMERA SCAN (Quagga2 — tuned for 1D retail barcodes: EAN/Code128/UPC) ================= */
   var quaggaRunning = false;
+  var CONTINUOUS_COOLDOWN_MS = 1400; // ignore repeat frames of the same raw code within this window
 
   function onQuaggaDetected(result){
     var code = result && result.codeResult && result.codeResult.code;
     if(!code) return;
-    if(navigator.vibrate) navigator.vibrate(80);
-    closeCamera();
-    handleScanResult(code);
+
+    if(state.continuousMode){
+      var now = Date.now();
+      if(state.lastCodeTime[code] && (now - state.lastCodeTime[code]) < CONTINUOUS_COOLDOWN_MS) return;
+      state.lastCodeTime[code] = now;
+
+      if(!state.stock.length){
+        toast("Chưa có file tồn kho cho cửa hàng này.", 2200);
+        return;
+      }
+      var matches = findMatches(code);
+      if(matches.length === 0){
+        if(navigator.vibrate) navigator.vibrate([40,60,40]);
+        toast("Không tìm thấy mã: " + code, 1600);
+      } else if(matches.length === 1){
+        if(navigator.vibrate) navigator.vibrate(50);
+        autoRecord(matches[0]);
+      } else {
+        try{ Quagga.pause(); }catch(e){}
+        showChooser(matches, "continuous");
+      }
+      // camera keeps running — no stop/restart between scans
+    } else {
+      if(navigator.vibrate) navigator.vibrate(80);
+      closeCamera();
+      handleScanResult(code);
+    }
+  }
+
+  async function autoRecord(prod){
+    var entry = {user: state.user, qty: 1, note: "", ts: Date.now()};
+    try{
+      await addEntryFs(state.shop, prod.code, entry);
+      pushRecentScan(prod, entry);
+      toast("+1 " + (prod.unit||"") + " — " + prod.name, 1500);
+    }catch(err){
+      console.error(err);
+      toast("Lỗi lưu, quét lại mã này.", 2000);
+    }
+  }
+
+  function pushRecentScan(prod, entry){
+    state.recentScans.unshift({product: prod, entry: entry});
+    if(state.recentScans.length > 12) state.recentScans.length = 12;
+    renderRecentFeed();
+  }
+
+  function renderRecentFeed(){
+    var box = $("recentFeed");
+    var list = $("recentList");
+    if(!state.recentScans.length){
+      box.classList.add("hide");
+      return;
+    }
+    box.classList.remove("hide");
+    list.innerHTML = state.recentScans.map(function(item, idx){
+      return '<div class="recent-row" id="recent-row-'+idx+'">' +
+        '<div style="flex:1; min-width:0;">' +
+          '<div class="rn">'+escapeHtml(item.product.name)+'</div>' +
+          '<div class="rc">'+escapeHtml(item.product.code)+' · '+escapeHtml(item.product.unit)+'</div>' +
+        '</div>' +
+        '<div class="rq">'+fmtNum(item.entry.qty)+'</div>' +
+        '<div class="recent-actions">' +
+          '<button data-edit="'+idx+'">Sửa</button>' +
+          '<button data-del="'+idx+'">Xoá</button>' +
+        '</div>' +
+      '</div>';
+    }).join("");
+    document.querySelectorAll("[data-edit]").forEach(function(btn){
+      btn.addEventListener("click", function(){ startEditRecent(parseInt(this.dataset.edit,10)); });
+    });
+    document.querySelectorAll("[data-del]").forEach(function(btn){
+      btn.addEventListener("click", function(){ deleteRecent(parseInt(this.dataset.del,10)); });
+    });
+  }
+
+  function startEditRecent(idx){
+    var item = state.recentScans[idx];
+    if(!item) return;
+    var row = document.getElementById("recent-row-"+idx);
+    row.innerHTML =
+      '<div style="flex:1; min-width:0;">' +
+        '<div class="rn">'+escapeHtml(item.product.name)+'</div>' +
+        '<div class="rc">'+escapeHtml(item.product.code)+' · '+escapeHtml(item.product.unit)+'</div>' +
+      '</div>' +
+      '<div class="recent-edit">' +
+        '<input type="number" min="0" inputmode="numeric" id="edit-qty-'+idx+'" value="'+item.entry.qty+'">' +
+        '<button class="btn btn-primary btn-sm" data-save="'+idx+'">Lưu</button>' +
+      '</div>';
+    document.querySelector('[data-save="'+idx+'"]').addEventListener("click", function(){
+      saveEditRecent(idx);
+    });
+  }
+
+  async function saveEditRecent(idx){
+    var item = state.recentScans[idx];
+    if(!item) return;
+    var newQty = Number(document.getElementById("edit-qty-"+idx).value || 0);
+    if(newQty < 0) newQty = 0;
+    var oldEntry = item.entry;
+    var newEntry = {user: oldEntry.user, qty: newQty, note: oldEntry.note||"", ts: oldEntry.ts};
+    try{
+      var ref = colEntries.doc(entryDocId(state.shop, item.product.code));
+      await ref.update({entries: firebase.firestore.FieldValue.arrayRemove(oldEntry)});
+      await ref.update({entries: firebase.firestore.FieldValue.arrayUnion(newEntry)});
+      item.entry = newEntry;
+      renderRecentFeed();
+      toast("Đã cập nhật số lượng");
+    }catch(err){
+      console.error(err);
+      toast("Cập nhật thất bại, thử lại.");
+      renderRecentFeed();
+    }
+  }
+
+  async function deleteRecent(idx){
+    var item = state.recentScans[idx];
+    if(!item) return;
+    try{
+      var ref = colEntries.doc(entryDocId(state.shop, item.product.code));
+      await ref.update({entries: firebase.firestore.FieldValue.arrayRemove(item.entry)});
+      state.recentScans.splice(idx,1);
+      renderRecentFeed();
+      toast("Đã xoá lần quét này");
+    }catch(err){
+      console.error(err);
+      toast("Xoá thất bại, thử lại.");
+    }
   }
 
   $("btnOpenCam").addEventListener("click", function(){
