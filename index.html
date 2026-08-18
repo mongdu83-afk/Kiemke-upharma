@@ -1152,7 +1152,7 @@
   var scanBuffer = [];          // rolling window of borderline reads, used only as a light fallback check
   var SCAN_BUFFER_SIZE = 3;
   var SCAN_CONSENSUS_COUNT = 2; // fallback: accept if the same borderline code repeats this many times
-  var GOOD_ERROR_THRESHOLD = 0.14; // Quagga per-bar decode error — balance point between speed and misreads
+  var GOOD_ERROR_THRESHOLD = 0.2; // EAN's built-in checksum is now the primary defense against misreads, so this can be more lenient for speed
 
   function avgDecodeError(result){
     var codes = result && result.codeResult && result.codeResult.decodedCodes;
@@ -1344,7 +1344,7 @@
         // no "area" crop — scans the full camera frame so aiming is more forgiving
       },
       decoder: {
-        readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader"]
+        readers: ["ean_reader","ean_8_reader"]
       },
       locate: true,
       locator: { patchSize: "medium", halfSample: true },
