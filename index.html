@@ -931,10 +931,31 @@
       $("btnCloseCam").classList.remove("hide");
       $("scanIdle").classList.add("hide");
 
-      if(!zxingReader) zxingReader = new ZXing.BrowserMultiFormatReader();
-      var deviceId = await pickRearCameraId();
+      if(!zxingReader){
+        var hints = new Map();
+        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+          ZXing.BarcodeFormat.EAN_13,
+          ZXing.BarcodeFormat.EAN_8,
+          ZXing.BarcodeFormat.UPC_A,
+          ZXing.BarcodeFormat.UPC_E,
+          ZXing.BarcodeFormat.CODE_128,
+          ZXing.BarcodeFormat.CODE_39,
+          ZXing.BarcodeFormat.ITF,
+          ZXing.BarcodeFormat.QR_CODE
+        ]);
+        hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+        zxingReader = new ZXing.BrowserMultiFormatReader(hints);
+      }
 
-      zxingControls = await zxingReader.decodeFromVideoDevice(deviceId, "camVideo", function(result, err){
+      var constraints = {
+        video: {
+          facingMode: {ideal: "environment"},
+          width: {ideal: 1920},
+          height: {ideal: 1080}
+        }
+      };
+
+      zxingControls = await zxingReader.decodeFromConstraints(constraints, "camVideo", function(result, err){
         if(result){
           var val = result.getText();
           if(navigator.vibrate) navigator.vibrate(80);
@@ -945,8 +966,22 @@
       });
     }catch(err){
       console.error(err);
-      toast("Không thể mở camera. Kiểm tra đã cho phép quyền truy cập camera cho trang này chưa.", 3600);
-      closeCamera();
+      // Some browsers reject the ideal 1080p request — retry with default camera constraints.
+      try{
+        var deviceId = await pickRearCameraId();
+        zxingControls = await zxingReader.decodeFromVideoDevice(deviceId, "camVideo", function(result, err2){
+          if(result){
+            var val2 = result.getText();
+            if(navigator.vibrate) navigator.vibrate(80);
+            closeCamera();
+            handleScanResult(val2);
+          }
+        });
+      }catch(err2){
+        console.error(err2);
+        toast("Không thể mở camera. Kiểm tra đã cho phép quyền truy cập camera cho trang này chưa.", 3600);
+        closeCamera();
+      }
     }
   });
 
