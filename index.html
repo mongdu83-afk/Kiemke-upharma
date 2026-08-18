@@ -518,7 +518,8 @@
     activeSessionId: null, // session staff are currently contributing counts to
     summarySessionId: null,// session being viewed in Tổng hợp (defaults to active)
     summaryFilter: "all",
-    entriesCache: {}      // code -> entries array (for current summary render)
+    entriesCache: {},     // code -> entries array (for current summary render)
+    totalsCache: {}       // code -> running total counted in the active session (local cache, avoids re-fetching every scan)
   };
 
   /* ---------------- helpers ---------------- */
@@ -623,14 +624,16 @@
     return snap.exists ? (snap.data().entries||[]) : [];
   }
   async function addEntryFs(shop, sessionId, code, entry){
-    await colEntries.doc(entryDocId(shop, sessionId, code)).set(
-      {entries: firebase.firestore.FieldValue.arrayUnion(entry)},
-      {merge:true}
-    );
-    await colIndex.doc(shop+"__"+sessionId).set(
-      {codes: firebase.firestore.FieldValue.arrayUnion(code)},
-      {merge:true}
-    );
+    await Promise.all([
+      colEntries.doc(entryDocId(shop, sessionId, code)).set(
+        {entries: firebase.firestore.FieldValue.arrayUnion(entry)},
+        {merge:true}
+      ),
+      colIndex.doc(shop+"__"+sessionId).set(
+        {codes: firebase.firestore.FieldValue.arrayUnion(code)},
+        {merge:true}
+      )
+    ]);
   }
   async function getIndexFs(shop, sessionId){
     var snap = await colIndex.doc(shop+"__"+sessionId).get();
@@ -780,6 +783,7 @@
       var data = await ensureActiveSession(state.shop);
       state.sessions = data.sessions;
       state.activeSessionId = data.activeSessionId;
+          state.totalsCache = {};
       state.summarySessionId = data.activeSessionId;
       updateCtxChip();
       renderSessionManager();
@@ -1059,6 +1063,7 @@
     var entries = await getEntries(state.shop, state.activeSessionId, prod.code);
     var totalCounted = entries.reduce(function(s,e){return s+Number(e.qty||0);},0);
     var yourCounted = entries.filter(function(e){return e.user===state.user;}).reduce(function(s,e){return s+Number(e.qty||0);},0);
+    state.totalsCache[prod.code] = totalCounted;
 
     $("pcCounted").textContent = fmtNum(totalCounted);
     if(yourCounted > 0){
@@ -1103,9 +1108,17 @@
     $("qtyInput").dispatchEvent(new Event("input"));
   });
 
-  /* ================= ENTRIES (shared, per product — backed by Firestore) ================= */
+  /* ---------------- ENTRIES (shared, per product — backed by Firestore) ---------------- */
   async function getIndex(sessionId){
     return await getIndexFs(state.shop, sessionId || state.activeSessionId);
+  }
+
+  async function getCachedTotal(code){
+    if(state.totalsCache.hasOwnProperty(code)) return state.totalsCache[code];
+    var entries = await getEntries(state.shop, state.activeSessionId, code);
+    var total = entries.reduce(function(s,e){ return s+Number(e.qty||0); }, 0);
+    state.totalsCache[code] = total;
+    return total;
   }
 
   $("btnConfirmCount").addEventListener("click", async function(){
@@ -1116,9 +1129,16 @@
     this.textContent = "Đang lưu...";
     try{
       var entry = {user: state.user, qty: Number(qty), note: $("pcNote").value.trim(), ts: Date.now()};
-      await addEntryFs(state.shop, state.activeSessionId, state.currentMatch.code, entry);
-      var entriesAfter = await getEntries(state.shop, state.activeSessionId, state.currentMatch.code);
-      var totalAfter = entriesAfter.reduce(function(s,e){return s+Number(e.qty||0);},0);
+      var priorTotal;
+      if(state.totalsCache.hasOwnProperty(state.currentMatch.code)){
+        priorTotal = state.totalsCache[state.currentMatch.code];
+        await addEntryFs(state.shop, state.activeSessionId, state.currentMatch.code, entry);
+      } else {
+        priorTotal = await getCachedTotal(state.currentMatch.code);
+        await addEntryFs(state.shop, state.activeSessionId, state.currentMatch.code, entry);
+      }
+      var totalAfter = priorTotal + qty;
+      state.totalsCache[state.currentMatch.code] = totalAfter;
       var statusInfo = statusFor(state.currentMatch, totalAfter);
       pushRecentScan(state.currentMatch, entry, statusInfo);
       beepSuccess();
@@ -1214,9 +1234,19 @@
   async function autoRecord(prod){
     var entry = {user: state.user, qty: 1, note: "", ts: Date.now()};
     try{
-      await addEntryFs(state.shop, state.activeSessionId, prod.code, entry);
-      var entriesAfter = await getEntries(state.shop, state.activeSessionId, prod.code);
-      var totalAfter = entriesAfter.reduce(function(s,e){return s+Number(e.qty||0);},0);
+      var priorTotal;
+      if(state.totalsCache.hasOwnProperty(prod.code)){
+        // Cache already warm — total lookup is free, so just fire the write.
+        priorTotal = state.totalsCache[prod.code];
+        await addEntryFs(state.shop, state.activeSessionId, prod.code, entry);
+      } else {
+        // First touch this session: must read the real total before writing, to avoid a race
+        // where the read could see the in-flight write and double-count.
+        priorTotal = await getCachedTotal(prod.code);
+        await addEntryFs(state.shop, state.activeSessionId, prod.code, entry);
+      }
+      var totalAfter = priorTotal + 1;
+      state.totalsCache[prod.code] = totalAfter;
       var statusInfo = statusFor(prod, totalAfter);
       pushRecentScan(prod, entry, statusInfo);
       beepSuccess();
@@ -1340,8 +1370,8 @@
           facingMode: "environment",
           width: {ideal: 800},
           height: {ideal: 600}
-        }
-        // no "area" crop — scans the full camera frame so aiming is more forgiving
+        },
+        area: { top: "14%", right: "14%", left: "14%", bottom: "14%" } // matches the visible green frame exactly
       },
       decoder: {
         readers: ["ean_reader","ean_8_reader"]
@@ -1512,6 +1542,7 @@
         try{
           await setActiveSession(state.shop, sid);
           state.activeSessionId = sid;
+          state.totalsCache = {};
           updateCtxChip();
           renderSessionManager();
           toast("Đã chuyển sang " + (state.sessions.find(function(s){return s.id===sid;})||{}).label);
@@ -1529,6 +1560,7 @@
           var result = await deleteSession(state.shop, sid);
           state.sessions = result.sessions;
           state.activeSessionId = result.activeSessionId;
+          state.totalsCache = {};
           state.summarySessionId = result.activeSessionId;
           updateCtxChip();
           renderSessionManager();
@@ -1548,6 +1580,7 @@
       var result = await createSession(state.shop, label.trim() || undefined);
       state.sessions = result.sessions;
       state.activeSessionId = result.activeSessionId;
+          state.totalsCache = {};
       state.summarySessionId = result.activeSessionId;
       updateCtxChip();
       renderSessionManager();
