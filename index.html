@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+<script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
 <style>
   :root{
     --ink:#0f2a2b;
@@ -400,7 +401,7 @@
     <div class="card" style="background:var(--teal-tint); border-color:#bfe0d6;">
       <h2 style="color:var(--teal-deep);">Ghi chú sử dụng</h2>
       <p class="sub" style="color:var(--teal-deep);">
-        • Quét mã tự động cần trình duyệt hỗ trợ (Chrome trên Android). Trên iPhone/Safari, dùng nhập mã tay.<br>
+        • Quét mã hoạt động trên cả iPhone (Safari) và Android (Chrome) — lần đầu mở camera trình duyệt sẽ xin quyền, bấm Cho phép.<br>
         • Ứng dụng đối chiếu 5 số đầu của mã quét với 5 số cuối của mã trong file tồn để định danh sản phẩm.<br>
         • Nhiều người có thể kiểm cùng lúc trên cùng cửa hàng — kết quả tự cộng dồn ở mục Tổng hợp.
       </p>
@@ -910,53 +911,52 @@
     if(e.key === "Enter"){ handleScanResult(this.value); }
   });
 
-  /* ================= CAMERA SCAN ================= */
+  /* ================= CAMERA SCAN (ZXing — works on iPhone Safari + Android Chrome) ================= */
+  var zxingReader = null;
+  var zxingControls = null;
   var camStream = null;
-  var detector = null;
-  var scanning = false;
-  var lastScanTs = 0;
+
+  async function pickRearCameraId(){
+    try{
+      var devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+      if(!devices.length) return undefined;
+      var back = devices.find(function(d){ return /back|rear|environment/i.test(d.label||""); });
+      return back ? back.deviceId : devices[devices.length-1].deviceId;
+    }catch(e){ return undefined; }
+  }
 
   $("btnOpenCam").addEventListener("click", async function(){
-    if(!("BarcodeDetector" in window)){
-      toast("Trình duyệt không hỗ trợ quét tự động. Vui lòng nhập mã tay hoặc dùng Chrome trên Android.", 3600);
-      return;
-    }
     try{
-      camStream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
-      $("camVideo").srcObject = camStream;
       $("camWrap").classList.remove("hide");
       $("btnCloseCam").classList.remove("hide");
       $("scanIdle").classList.add("hide");
-      detector = new BarcodeDetector();
-      scanning = true;
-      requestAnimationFrame(scanLoop);
-    }catch(err){
-      console.error(err);
-      toast("Không thể mở camera. Kiểm tra quyền truy cập camera.", 3200);
-    }
-  });
 
-  async function scanLoop(){
-    if(!scanning) return;
-    var now = Date.now();
-    if(now - lastScanTs > 350){
-      lastScanTs = now;
-      try{
-        var codes = await detector.detect($("camVideo"));
-        if(codes && codes.length){
-          var val = codes[0].rawValue;
+      if(!zxingReader) zxingReader = new ZXing.BrowserMultiFormatReader();
+      var deviceId = await pickRearCameraId();
+
+      zxingControls = await zxingReader.decodeFromVideoDevice(deviceId, "camVideo", function(result, err){
+        if(result){
+          var val = result.getText();
           if(navigator.vibrate) navigator.vibrate(80);
           closeCamera();
           handleScanResult(val);
-          return;
         }
-      }catch(e){ /* ignore per-frame errors */ }
+        // NotFoundException fires on every frame with no code detected — expected noise, ignore it.
+      });
+    }catch(err){
+      console.error(err);
+      toast("Không thể mở camera. Kiểm tra đã cho phép quyền truy cập camera cho trang này chưa.", 3600);
+      closeCamera();
     }
-    requestAnimationFrame(scanLoop);
-  }
+  });
 
   function closeCamera(){
-    scanning = false;
+    if(zxingControls){
+      try{ zxingControls.stop(); }catch(e){}
+      zxingControls = null;
+    } else if(zxingReader){
+      try{ zxingReader.reset(); }catch(e){}
+    }
     if(camStream){
       camStream.getTracks().forEach(function(t){ t.stop(); });
       camStream = null;
