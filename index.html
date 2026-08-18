@@ -547,14 +547,14 @@
       primer.stop(audioCtx.currentTime + 0.02);
     }catch(e){ /* ignore — non-critical */ }
   }
-  function playTone(freq, duration, vol){
+  function playTone(freq, duration, vol, waveType){
     try{
       if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       if(audioCtx.state === "suspended") audioCtx.resume();
       var osc = audioCtx.createOscillator();
       var gain = audioCtx.createGain();
       osc.connect(gain); gain.connect(audioCtx.destination);
-      osc.type = "sine";
+      osc.type = waveType || "sine";
       osc.frequency.value = freq;
       gain.gain.setValueAtTime(vol||0.5, audioCtx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
@@ -563,10 +563,10 @@
     }catch(e){ /* ignore — non-critical */ }
   }
   function beepSuccess(){
-    playTone(1200, 0.09, 0.6);
-    setTimeout(function(){ playTone(1500, 0.09, 0.6); }, 110);
+    playTone(1200, 0.13, 1.0, "square");
+    setTimeout(function(){ playTone(1600, 0.13, 1.0, "square"); }, 130);
   }
-  function beepNotFound(){ playTone(260, 0.22, 0.5); }
+  function beepNotFound(){ playTone(240, 0.28, 0.9, "square"); }
 
   /* ---------------- Firestore helpers ---------------- */
   var STOCK_CHUNK_SIZE = 1500; // keeps each stock document safely under the 1MB Firestore limit
@@ -1263,15 +1263,15 @@
           facingMode: "environment",
           width: {ideal: 1280},
           height: {ideal: 720}
-        },
-        area: { top: "20%", right: "8%", left: "8%", bottom: "20%" }
+        }
+        // no "area" crop — scans the full camera frame so aiming is more forgiving
       },
       decoder: {
         readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader"]
       },
       locate: true,
       locator: { patchSize: "medium", halfSample: true },
-      numOfWorkers: 2,
+      numOfWorkers: 0, // main-thread decoding — more reliable than Web Workers, which can silently fail on some mobile browsers
       frequency: 10
     }, function(err){
       if(err){
