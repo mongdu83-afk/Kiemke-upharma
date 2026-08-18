@@ -1152,7 +1152,7 @@
   var scanBuffer = [];          // rolling window of borderline reads, used only as a light fallback check
   var SCAN_BUFFER_SIZE = 3;
   var SCAN_CONSENSUS_COUNT = 2; // fallback: accept if the same borderline code repeats this many times
-  var GOOD_ERROR_THRESHOLD = 0.18; // Quagga per-bar decode error — loosened so more valid single reads pass through
+  var GOOD_ERROR_THRESHOLD = 0.14; // Quagga per-bar decode error — balance point between speed and misreads
 
   function avgDecodeError(result){
     var codes = result && result.codeResult && result.codeResult.decodedCodes;
@@ -1338,8 +1338,8 @@
         target: document.querySelector("#camContainer"),
         constraints: {
           facingMode: "environment",
-          width: {ideal: 640},
-          height: {ideal: 480}
+          width: {ideal: 800},
+          height: {ideal: 600}
         }
         // no "area" crop — scans the full camera frame so aiming is more forgiving
       },
@@ -1347,7 +1347,7 @@
         readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader"]
       },
       locate: true,
-      locator: { patchSize: "medium", halfSample: false },
+      locator: { patchSize: "medium", halfSample: true },
       numOfWorkers: 0 // multi-worker mode fails completely on some devices — single-thread is slower but reliable
     }, function(err){
       if(err){
