@@ -530,6 +530,44 @@
   function fmtNum(n){ return Number(n||0).toLocaleString("vi-VN"); }
   function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 
+  /* ---------------- audio feedback (vibration doesn't work on iPhone Safari, so sound is the main signal) ---------------- */
+  var audioCtx = null;
+  function ensureAudio(){
+    try{
+      if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if(audioCtx.state === "suspended") audioCtx.resume();
+      // Prime playback with a near-silent blip — some iOS Safari versions need an actual
+      // oscillator start/stop during the user gesture to fully unlock audio, not just resume().
+      var primer = audioCtx.createOscillator();
+      var primerGain = audioCtx.createGain();
+      primer.connect(primerGain); primerGain.connect(audioCtx.destination);
+      primerGain.gain.value = 0.0001;
+      primer.frequency.value = 440;
+      primer.start();
+      primer.stop(audioCtx.currentTime + 0.02);
+    }catch(e){ /* ignore — non-critical */ }
+  }
+  function playTone(freq, duration, vol){
+    try{
+      if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if(audioCtx.state === "suspended") audioCtx.resume();
+      var osc = audioCtx.createOscillator();
+      var gain = audioCtx.createGain();
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(vol||0.5, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+      osc.start();
+      osc.stop(audioCtx.currentTime + duration + 0.03);
+    }catch(e){ /* ignore — non-critical */ }
+  }
+  function beepSuccess(){
+    playTone(1200, 0.09, 0.6);
+    setTimeout(function(){ playTone(1500, 0.09, 0.6); }, 110);
+  }
+  function beepNotFound(){ playTone(260, 0.22, 0.5); }
+
   /* ---------------- Firestore helpers ---------------- */
   var STOCK_CHUNK_SIZE = 1500; // keeps each stock document safely under the 1MB Firestore limit
 
@@ -649,6 +687,7 @@
   initGate();
 
   $("gateEnter").addEventListener("click", async function(){
+    ensureAudio();
     var name = $("gateName").value.trim();
     var shop = $("gateShop").value;
     if(!name){ toast("Vui lòng nhập tên người kiểm"); return; }
@@ -882,6 +921,7 @@
     var matches = findMatches(scanValue);
     hideAllResultBlocks();
     if(matches.length === 0){
+      beepNotFound();
       $("noMatch").classList.remove("hide");
     } else if(matches.length === 1){
       await showProductCard(matches[0]);
@@ -956,19 +996,18 @@
     $("prodCard").scrollIntoView({behavior:"smooth", block:"start"});
   }
 
+  function statusFor(prod, total){
+    if(total === prod.stock) return {cls:"ok", label:"✓ Đã khớp tồn hệ thống"};
+    if(total < prod.stock) return {cls:"under", label:"⚠ Chưa đủ so với tồn hệ thống"};
+    return {cls:"over", label:"✕ Đã vượt tồn hệ thống"};
+  }
+
   function updateStatusBanner(prod, projectedTotal){
     var el = $("pcStatusBanner");
+    var info = statusFor(prod, projectedTotal);
     el.classList.remove("hide","status-ok","status-under","status-over");
-    if(projectedTotal === prod.stock){
-      el.classList.add("status-ok");
-      el.textContent = "✓ Đã khớp tồn hệ thống";
-    } else if(projectedTotal < prod.stock){
-      el.classList.add("status-under");
-      el.textContent = "⚠ Chưa đủ so với tồn hệ thống — kiểm tra lại đã đếm hết chưa";
-    } else {
-      el.classList.add("status-over");
-      el.textContent = "✕ Đã vượt tồn hệ thống — kiểm tra lại số lượng vừa nhập";
-    }
+    el.classList.add("status-"+info.cls);
+    el.textContent = info.label + (info.cls==="under" ? " — kiểm tra lại đã đếm hết chưa" : info.cls==="over" ? " — kiểm tra lại số lượng vừa nhập" : "");
   }
 
   $("qtyInput").addEventListener("input", async function(){
@@ -1001,8 +1040,12 @@
     try{
       var entry = {user: state.user, qty: Number(qty), note: $("pcNote").value.trim(), ts: Date.now()};
       await addEntryFs(state.shop, state.currentMatch.code, entry);
-      pushRecentScan(state.currentMatch, entry);
-      toast("Đã ghi nhận " + fmtNum(qty) + " " + (state.currentMatch.unit||"") + " — " + state.currentMatch.name);
+      var entriesAfter = await getEntries(state.shop, state.currentMatch.code);
+      var totalAfter = entriesAfter.reduce(function(s,e){return s+Number(e.qty||0);},0);
+      var statusInfo = statusFor(state.currentMatch, totalAfter);
+      pushRecentScan(state.currentMatch, entry, statusInfo);
+      beepSuccess();
+      toast("Đã ghi nhận " + fmtNum(qty) + " " + (state.currentMatch.unit||"") + " — " + state.currentMatch.name + " · " + statusInfo.label);
       hideAllResultBlocks();
       $("manualCode").value = "";
       $("manualCode").focus();
@@ -1027,11 +1070,12 @@
 
   /* ================= CAMERA SCAN (Quagga2 — tuned for 1D retail barcodes: EAN/Code128) ================= */
   var quaggaRunning = false;
+  var scanLocked = false;       // prevents a single physical scan from firing twice
   var CONTINUOUS_COOLDOWN_MS = 1400; // ignore repeat frames of the same raw code within this window
   var scanBuffer = [];          // rolling window of borderline reads, used only as a light fallback check
   var SCAN_BUFFER_SIZE = 3;
   var SCAN_CONSENSUS_COUNT = 2; // fallback: accept if the same borderline code repeats this many times
-  var GOOD_ERROR_THRESHOLD = 0.12; // Quagga per-bar decode error — low enough to trust on the first read
+  var GOOD_ERROR_THRESHOLD = 0.18; // Quagga per-bar decode error — loosened so more valid single reads pass through
 
   function avgDecodeError(result){
     var codes = result && result.codeResult && result.codeResult.decodedCodes;
@@ -1043,6 +1087,7 @@
   }
 
   function onQuaggaDetected(result){
+    if(scanLocked) return; // guards against Quagga firing twice for the same physical scan
     var code = result && result.codeResult && result.codeResult.code;
     if(!code) return;
 
@@ -1061,6 +1106,9 @@
       if(state.lastCodeTime[code] && (now - state.lastCodeTime[code]) < CONTINUOUS_COOLDOWN_MS) return;
       state.lastCodeTime[code] = now;
 
+      scanLocked = true;
+      setTimeout(function(){ scanLocked = false; }, CONTINUOUS_COOLDOWN_MS);
+
       if(!state.stock.length){
         toast("Chưa có file tồn kho cho cửa hàng này.", 2200);
         return;
@@ -1068,6 +1116,7 @@
       var matches = findMatches(code);
       if(matches.length === 0){
         if(navigator.vibrate) navigator.vibrate([40,60,40]);
+        beepNotFound();
         toast("Không tìm thấy mã: " + code, 1600);
       } else if(matches.length === 1){
         if(navigator.vibrate) navigator.vibrate(50);
@@ -1078,6 +1127,7 @@
       }
       // camera keeps running — no stop/restart between scans
     } else {
+      scanLocked = true; // released in closeCamera()
       if(navigator.vibrate) navigator.vibrate(80);
       closeCamera();
       handleScanResult(code);
@@ -1088,16 +1138,21 @@
     var entry = {user: state.user, qty: 1, note: "", ts: Date.now()};
     try{
       await addEntryFs(state.shop, prod.code, entry);
-      pushRecentScan(prod, entry);
-      toast("+1 " + (prod.unit||"") + " — " + prod.name, 1500);
+      var entriesAfter = await getEntries(state.shop, prod.code);
+      var totalAfter = entriesAfter.reduce(function(s,e){return s+Number(e.qty||0);},0);
+      var statusInfo = statusFor(prod, totalAfter);
+      pushRecentScan(prod, entry, statusInfo);
+      beepSuccess();
+      toast("+1 " + (prod.unit||"") + " — " + prod.name + " · " + statusInfo.label, 2000);
     }catch(err){
       console.error(err);
+      beepNotFound();
       toast("Lỗi lưu, quét lại mã này.", 2000);
     }
   }
 
-  function pushRecentScan(prod, entry){
-    state.recentScans.unshift({product: prod, entry: entry});
+  function pushRecentScan(prod, entry, statusInfo){
+    state.recentScans.unshift({product: prod, entry: entry, statusInfo: statusInfo || null});
     if(state.recentScans.length > 12) state.recentScans.length = 12;
     renderRecentFeed();
   }
@@ -1110,11 +1165,14 @@
       return;
     }
     box.classList.remove("hide");
+    var badgeCls = {ok:"badge-ok", under:"badge-under", over:"badge-over"};
     list.innerHTML = state.recentScans.map(function(item, idx){
+      var badge = item.statusInfo ? '<span class="sum-badge '+(badgeCls[item.statusInfo.cls]||"badge-none")+'" style="margin-top:4px; display:inline-block;">'+item.statusInfo.label.replace("✓ ","").replace("⚠ ","").replace("✕ ","")+'</span>' : '';
       return '<div class="recent-row" id="recent-row-'+idx+'">' +
         '<div style="flex:1; min-width:0;">' +
           '<div class="rn">'+escapeHtml(item.product.name)+'</div>' +
           '<div class="rc">'+escapeHtml(item.product.code)+' · '+escapeHtml(item.product.unit)+'</div>' +
+          badge +
         '</div>' +
         '<div class="rq">'+fmtNum(item.entry.qty)+'</div>' +
         '<div class="recent-actions">' +
@@ -1186,6 +1244,7 @@
   }
 
   $("btnOpenCam").addEventListener("click", function(){
+    ensureAudio();
     if(typeof Quagga === "undefined"){
       toast("Chưa tải được thư viện quét mã (mạng chậm?). Vui lòng tải lại trang và thử lại, hoặc nhập mã tay.", 4000);
       return;
@@ -1194,6 +1253,7 @@
     $("btnCloseCam").classList.remove("hide");
     $("scanIdle").classList.add("hide");
     scanBuffer = [];
+    scanLocked = false;
 
     Quagga.init({
       inputStream: {
@@ -1207,7 +1267,7 @@
         area: { top: "20%", right: "8%", left: "8%", bottom: "20%" }
       },
       decoder: {
-        readers: ["ean_reader","ean_8_reader","code_128_reader"]
+        readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader"]
       },
       locate: true,
       locator: { patchSize: "medium", halfSample: true },
@@ -1228,6 +1288,7 @@
   });
 
   function closeCamera(){
+    scanLocked = false;
     if(quaggaRunning){
       try{
         Quagga.offDetected(onQuaggaDetected);
