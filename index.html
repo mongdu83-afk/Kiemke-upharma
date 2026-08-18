@@ -334,7 +334,7 @@
     <div id="camWrap" class="hide">
       <div id="camContainer"></div>
       <div class="cam-frame"></div>
-      <div class="cam-hint">Đưa mã vạch vào khung hình</div>
+      <div class="cam-hint">Giữ cách mã vạch 10-15cm, đủ sáng, giữ yên tay</div>
     </div>
     <button class="btn btn-ghost hide" id="btnCloseCam" style="margin-bottom:14px;">Đóng camera</button>
 
@@ -409,7 +409,9 @@
   <div id="view-summary" class="view hide">
     <div class="card">
       <h2>Tổng hợp kiểm kê</h2>
-      <p class="sub">Kết quả cộng dồn từ tất cả người kiểm tại cửa hàng hiện tại.</p>
+      <p class="sub">Kết quả cộng dồn từ tất cả người kiểm, theo từng đợt kiểm kê.</p>
+      <label class="field-label">Xem đợt kiểm kê</label>
+      <select id="summarySessionSelect" style="margin-bottom:12px;"></select>
       <div class="sum-toolbar">
         <button class="filter-pill active" data-f="all">Tất cả</button>
         <button class="filter-pill" data-f="counted">Đã kiểm</button>
@@ -441,9 +443,10 @@
     </div>
 
     <div class="card">
-      <h2>Bắt đầu đợt kiểm kê mới</h2>
-      <p class="sub">Xoá toàn bộ số liệu đã kiểm (của mọi người kiểm) cho cửa hàng hiện tại để bắt đầu đợt kiểm kê mới. Không xoá file tồn kho tham chiếu.</p>
-      <button class="btn btn-danger" id="btnResetCounts">Xoá số liệu kiểm kê đợt này</button>
+      <h2>Đợt kiểm kê</h2>
+      <p class="sub">Mỗi đợt lưu số liệu riêng biệt — dùng khi kiểm kê nhiều lần vào các ngày khác nhau. Nhân viên luôn ghi vào đợt đang chọn làm hiện tại.</p>
+      <div id="sessionList" style="margin-bottom:12px;"></div>
+      <button class="btn btn-primary btn-sm" id="btnNewSession">+ Tạo đợt kiểm kê mới</button>
     </div>
 
     <div class="card" style="background:var(--teal-tint); border-color:#bfe0d6;">
@@ -495,6 +498,7 @@
   var colStock = db.collection("kiemke_stock");
   var colEntries = db.collection("kiemke_entries");
   var colIndex = db.collection("kiemke_index");
+  var colSessions = db.collection("kiemke_sessions");
 
   /* ---------------- constants ---------------- */
   var DEFAULT_SHOPS = ["SHOP0058","SHOP0059","SHOP0072","SHOP0074","SHOP0089","SHOP0095","SHOP0121","SHOP0122","SHOP0163"];
@@ -510,6 +514,9 @@
     continuousMode: false,
     lastCodeTime: {},     // raw scanned code -> ts, debounce repeat frames
     recentScans: [],      // [{product, entry}] most recent first, continuous-mode feed
+    sessions: [],          // [{id,label,createdAt}] counting sessions for the current shop
+    activeSessionId: null, // session staff are currently contributing counts to
+    summarySessionId: null,// session being viewed in Tổng hợp (defaults to active)
     summaryFilter: "all",
     entriesCache: {}      // code -> entries array (for current summary render)
   };
@@ -609,36 +616,88 @@
     return list;
   }
 
-  function entryDocId(shop, code){ return shop + "__" + code; }
+  function entryDocId(shop, sessionId, code){ return shop + "__" + sessionId + "__" + code; }
 
-  async function getEntries(shop, code){
-    var snap = await colEntries.doc(entryDocId(shop, code)).get();
+  async function getEntries(shop, sessionId, code){
+    var snap = await colEntries.doc(entryDocId(shop, sessionId, code)).get();
     return snap.exists ? (snap.data().entries||[]) : [];
   }
-  async function addEntryFs(shop, code, entry){
-    await colEntries.doc(entryDocId(shop, code)).set(
+  async function addEntryFs(shop, sessionId, code, entry){
+    await colEntries.doc(entryDocId(shop, sessionId, code)).set(
       {entries: firebase.firestore.FieldValue.arrayUnion(entry)},
       {merge:true}
     );
-    await colIndex.doc(shop).set(
+    await colIndex.doc(shop+"__"+sessionId).set(
       {codes: firebase.firestore.FieldValue.arrayUnion(code)},
       {merge:true}
     );
   }
-  async function getIndexFs(shop){
-    var snap = await colIndex.doc(shop).get();
+  async function getIndexFs(shop, sessionId){
+    var snap = await colIndex.doc(shop+"__"+sessionId).get();
     return snap.exists ? (snap.data().codes||[]) : [];
   }
-  async function resetCountsFs(shop){
-    var codes = await getIndexFs(shop);
+
+  /* ---------------- counting sessions (multiple dated kiểm kê rounds per shop) ---------------- */
+  function newSessionId(){ return "s" + Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
+  function formatDateVN(d){
+    var dd = String(d.getDate()).padStart(2,"0");
+    var mm = String(d.getMonth()+1).padStart(2,"0");
+    return dd + "/" + mm + "/" + d.getFullYear();
+  }
+
+  async function getSessions(shop){
+    var snap = await colSessions.doc(shop).get();
+    if(!snap.exists) return {sessions:[], activeSessionId:null};
+    var d = snap.data();
+    return {sessions: d.sessions||[], activeSessionId: d.activeSessionId||null};
+  }
+
+  // Called whenever a shop is loaded — creates a first session automatically if none exist yet.
+  async function ensureActiveSession(shop){
+    var data = await getSessions(shop);
+    if(data.sessions.length && data.activeSessionId) return data;
+    var sess = {id:newSessionId(), label:"Đợt " + formatDateVN(new Date()), createdAt: Date.now()};
+    var sessions = data.sessions.concat([sess]);
+    await colSessions.doc(shop).set({sessions: sessions, activeSessionId: sess.id}, {merge:true});
+    return {sessions: sessions, activeSessionId: sess.id};
+  }
+
+  async function createSession(shop, label){
+    var data = await getSessions(shop);
+    var sess = {id:newSessionId(), label: label || ("Đợt " + formatDateVN(new Date())), createdAt: Date.now()};
+    var sessions = data.sessions.concat([sess]);
+    await colSessions.doc(shop).set({sessions: sessions, activeSessionId: sess.id}, {merge:true});
+    return {sessions: sessions, activeSessionId: sess.id};
+  }
+
+  async function setActiveSession(shop, sessionId){
+    await colSessions.doc(shop).set({activeSessionId: sessionId}, {merge:true});
+  }
+
+  async function deleteSession(shop, sessionId){
+    var codes = await getIndexFs(shop, sessionId);
     for(var i=0;i<codes.length;i+=450){
       var batch = db.batch();
       codes.slice(i, i+450).forEach(function(code){
-        batch.delete(colEntries.doc(entryDocId(shop, code)));
+        batch.delete(colEntries.doc(entryDocId(shop, sessionId, code)));
       });
       await batch.commit();
     }
-    await colIndex.doc(shop).delete();
+    await colIndex.doc(shop+"__"+sessionId).delete();
+
+    var data = await getSessions(shop);
+    var remaining = data.sessions.filter(function(s){ return s.id !== sessionId; });
+    var newActive = data.activeSessionId;
+    if(newActive === sessionId){
+      newActive = remaining.length ? remaining[remaining.length-1].id : null;
+    }
+    if(!remaining.length){
+      var fresh = {id:newSessionId(), label:"Đợt " + formatDateVN(new Date()), createdAt: Date.now()};
+      remaining = [fresh];
+      newActive = fresh.id;
+    }
+    await colSessions.doc(shop).set({sessions: remaining, activeSessionId: newActive}, {merge:true});
+    return {sessions: remaining, activeSessionId: newActive};
   }
 
   /* ================= GATE ================= */
@@ -699,10 +758,14 @@
     $("gate").classList.add("hide");
     updateCtxChip();
     await loadStockForShop();
+    await loadSessionsForShop();
   });
 
   function updateCtxChip(){
-    $("ctxText").innerHTML = "<b>" + state.shop + "</b> · " + state.user;
+    var sessLabel = "";
+    var sess = state.sessions.find(function(s){ return s.id === state.activeSessionId; });
+    if(sess) sessLabel = " · " + sess.label;
+    $("ctxText").innerHTML = "<b>" + state.shop + "</b> · " + state.user + sessLabel;
     $("curUserLine").textContent = state.user + " · cửa hàng " + state.shop;
   }
   $("ctxChip").addEventListener("click", function(){
@@ -711,6 +774,20 @@
   $("btnChangeUser").addEventListener("click", function(){
     $("gate").classList.remove("hide");
   });
+
+  async function loadSessionsForShop(){
+    try{
+      var data = await ensureActiveSession(state.shop);
+      state.sessions = data.sessions;
+      state.activeSessionId = data.activeSessionId;
+      state.summarySessionId = data.activeSessionId;
+      updateCtxChip();
+      renderSessionManager();
+    }catch(e){
+      console.error(e);
+      toast("Không tải được đợt kiểm kê. Kiểm tra kết nối mạng.");
+    }
+  }
 
   /* ================= CONTINUOUS SCAN MODE TOGGLE ================= */
   state.continuousMode = localStorage.getItem("kiemke_continuous") === "1";
@@ -979,7 +1056,7 @@
     $("pcNote").value = "";
     $("pcStatusBanner").classList.add("hide");
 
-    var entries = await getEntries(state.shop, prod.code);
+    var entries = await getEntries(state.shop, state.activeSessionId, prod.code);
     var totalCounted = entries.reduce(function(s,e){return s+Number(e.qty||0);},0);
     var yourCounted = entries.filter(function(e){return e.user===state.user;}).reduce(function(s,e){return s+Number(e.qty||0);},0);
 
@@ -1012,7 +1089,7 @@
 
   $("qtyInput").addEventListener("input", async function(){
     if(!state.currentMatch) return;
-    var entries = await getEntries(state.shop, state.currentMatch.code);
+    var entries = await getEntries(state.shop, state.activeSessionId, state.currentMatch.code);
     var existingTotal = entries.reduce(function(s,e){return s+Number(e.qty||0);},0);
     var newQty = Number($("qtyInput").value||0);
     updateStatusBanner(state.currentMatch, existingTotal + newQty);
@@ -1027,8 +1104,8 @@
   });
 
   /* ================= ENTRIES (shared, per product — backed by Firestore) ================= */
-  async function getIndex(){
-    return await getIndexFs(state.shop);
+  async function getIndex(sessionId){
+    return await getIndexFs(state.shop, sessionId || state.activeSessionId);
   }
 
   $("btnConfirmCount").addEventListener("click", async function(){
@@ -1039,8 +1116,8 @@
     this.textContent = "Đang lưu...";
     try{
       var entry = {user: state.user, qty: Number(qty), note: $("pcNote").value.trim(), ts: Date.now()};
-      await addEntryFs(state.shop, state.currentMatch.code, entry);
-      var entriesAfter = await getEntries(state.shop, state.currentMatch.code);
+      await addEntryFs(state.shop, state.activeSessionId, state.currentMatch.code, entry);
+      var entriesAfter = await getEntries(state.shop, state.activeSessionId, state.currentMatch.code);
       var totalAfter = entriesAfter.reduce(function(s,e){return s+Number(e.qty||0);},0);
       var statusInfo = statusFor(state.currentMatch, totalAfter);
       pushRecentScan(state.currentMatch, entry, statusInfo);
@@ -1137,8 +1214,8 @@
   async function autoRecord(prod){
     var entry = {user: state.user, qty: 1, note: "", ts: Date.now()};
     try{
-      await addEntryFs(state.shop, prod.code, entry);
-      var entriesAfter = await getEntries(state.shop, prod.code);
+      await addEntryFs(state.shop, state.activeSessionId, prod.code, entry);
+      var entriesAfter = await getEntries(state.shop, state.activeSessionId, prod.code);
       var totalAfter = entriesAfter.reduce(function(s,e){return s+Number(e.qty||0);},0);
       var statusInfo = statusFor(prod, totalAfter);
       pushRecentScan(prod, entry, statusInfo);
@@ -1215,7 +1292,7 @@
     var oldEntry = item.entry;
     var newEntry = {user: oldEntry.user, qty: newQty, note: oldEntry.note||"", ts: oldEntry.ts};
     try{
-      var ref = colEntries.doc(entryDocId(state.shop, item.product.code));
+      var ref = colEntries.doc(entryDocId(state.shop, state.activeSessionId, item.product.code));
       await ref.update({entries: firebase.firestore.FieldValue.arrayRemove(oldEntry)});
       await ref.update({entries: firebase.firestore.FieldValue.arrayUnion(newEntry)});
       item.entry = newEntry;
@@ -1232,7 +1309,7 @@
     var item = state.recentScans[idx];
     if(!item) return;
     try{
-      var ref = colEntries.doc(entryDocId(state.shop, item.product.code));
+      var ref = colEntries.doc(entryDocId(state.shop, state.activeSessionId, item.product.code));
       await ref.update({entries: firebase.firestore.FieldValue.arrayRemove(item.entry)});
       state.recentScans.splice(idx,1);
       renderRecentFeed();
@@ -1270,9 +1347,8 @@
         readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader"]
       },
       locate: true,
-      locator: { patchSize: "medium", halfSample: true },
-      numOfWorkers: 0, // main-thread decoding — more reliable than Web Workers, which can silently fail on some mobile browsers
-      frequency: 10
+      locator: { patchSize: "large", halfSample: true },
+      numOfWorkers: Math.min(4, (navigator.hardwareConcurrency || 2))
     }, function(err){
       if(err){
         console.error(err);
@@ -1320,10 +1396,11 @@
       list.innerHTML = '<div class="empty"><div class="em-icon">📄</div>Chưa có file tồn kho cho cửa hàng này.<br>Vào Cài đặt để tải lên.</div>';
       return;
     }
-    var index = await getIndex();
+    var sessId = state.summarySessionId || state.activeSessionId;
+    var index = await getIndex(sessId);
     var cache = {};
     for(var i=0;i<index.length;i++){
-      cache[index[i]] = await getEntries(state.shop, index[i]);
+      cache[index[i]] = await getEntries(state.shop, sessId, index[i]);
     }
     state.entriesCache = cache;
     renderSummaryFromCache();
@@ -1405,21 +1482,92 @@
     XLSX.writeFile(wb, fname);
   });
 
-  /* ================= RESET COUNTS ================= */
-  $("btnResetCounts").addEventListener("click", async function(){
-    if(!confirm("Xoá toàn bộ số liệu kiểm kê đã ghi cho cửa hàng " + state.shop + "? Hành động này không thể hoàn tác.")) return;
-    this.disabled = true;
-    this.textContent = "Đang xoá...";
-    try{
-      await resetCountsFs(state.shop);
-      state.entriesCache = {};
-      toast("Đã xoá số liệu kiểm kê. Sẵn sàng cho đợt mới.");
-    }catch(err){
-      console.error(err);
-      toast("Xoá thất bại, thử lại. Kiểm tra kết nối mạng.");
+  /* ================= SESSION MANAGER (Cài đặt) ================= */
+  function renderSessionManager(){
+    var box = $("sessionList");
+    if(!box) return;
+    if(!state.sessions.length){
+      box.innerHTML = '<p class="sub">Chưa có đợt kiểm kê nào.</p>';
+      populateSummarySessionSelect();
+      return;
     }
+    var sorted = state.sessions.slice().sort(function(a,b){ return b.createdAt - a.createdAt; });
+    box.innerHTML = sorted.map(function(s){
+      var isActive = s.id === state.activeSessionId;
+      return '<div class="recent-row">' +
+        '<div style="flex:1; min-width:0;">' +
+          '<div class="rn">'+escapeHtml(s.label)+(isActive ? ' <span style="color:var(--teal); font-weight:800;">· Đang dùng</span>' : '')+'</div>' +
+          '<div class="rc">Tạo lúc '+new Date(s.createdAt).toLocaleString("vi-VN")+'</div>' +
+        '</div>' +
+        '<div class="recent-actions">' +
+          (isActive ? '' : '<button data-usesession="'+s.id+'">Chọn</button>') +
+          '<button data-delsession="'+s.id+'">Xoá</button>' +
+        '</div>' +
+      '</div>';
+    }).join("");
+    document.querySelectorAll("[data-usesession]").forEach(function(btn){
+      btn.addEventListener("click", async function(){
+        var sid = this.dataset.usesession;
+        this.disabled = true;
+        try{
+          await setActiveSession(state.shop, sid);
+          state.activeSessionId = sid;
+          updateCtxChip();
+          renderSessionManager();
+          toast("Đã chuyển sang " + (state.sessions.find(function(s){return s.id===sid;})||{}).label);
+        }catch(e){ console.error(e); toast("Lỗi, thử lại."); }
+        this.disabled = false;
+      });
+    });
+    document.querySelectorAll("[data-delsession]").forEach(function(btn){
+      btn.addEventListener("click", async function(){
+        var sid = this.dataset.delsession;
+        var sess = state.sessions.find(function(s){return s.id===sid;});
+        if(!confirm("Xoá toàn bộ số liệu của \"" + (sess?sess.label:"") + "\"? Không thể hoàn tác.")) return;
+        this.disabled = true;
+        try{
+          var result = await deleteSession(state.shop, sid);
+          state.sessions = result.sessions;
+          state.activeSessionId = result.activeSessionId;
+          state.summarySessionId = result.activeSessionId;
+          updateCtxChip();
+          renderSessionManager();
+          toast("Đã xoá đợt kiểm kê.");
+        }catch(e){ console.error(e); toast("Xoá thất bại, thử lại."); }
+        this.disabled = false;
+      });
+    });
+    populateSummarySessionSelect();
+  }
+
+  $("btnNewSession").addEventListener("click", async function(){
+    var label = prompt("Đặt tên cho đợt kiểm kê mới (VD: Đợt tháng 9):", "Đợt " + formatDateVN(new Date()));
+    if(label === null) return;
+    this.disabled = true;
+    try{
+      var result = await createSession(state.shop, label.trim() || undefined);
+      state.sessions = result.sessions;
+      state.activeSessionId = result.activeSessionId;
+      state.summarySessionId = result.activeSessionId;
+      updateCtxChip();
+      renderSessionManager();
+      toast("Đã tạo và chuyển sang đợt mới.");
+    }catch(e){ console.error(e); toast("Tạo đợt thất bại, thử lại."); }
     this.disabled = false;
-    this.textContent = "Xoá số liệu kiểm kê đợt này";
+  });
+
+  function populateSummarySessionSelect(){
+    var sel = $("summarySessionSelect");
+    if(!sel) return;
+    var sorted = state.sessions.slice().sort(function(a,b){ return b.createdAt - a.createdAt; });
+    sel.innerHTML = sorted.map(function(s){
+      return '<option value="'+s.id+'">'+escapeHtml(s.label)+(s.id===state.activeSessionId ? " (đang dùng)" : "")+'</option>';
+    }).join("");
+    sel.value = state.summarySessionId || state.activeSessionId;
+  }
+  $("summarySessionSelect").addEventListener("change", function(){
+    state.summarySessionId = this.value;
+    renderSummary();
   });
 
 })();
