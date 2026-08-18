@@ -7,7 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
-<script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.4/dist/quagga.min.js"></script>
 <style>
   :root{
     --ink:#0f2a2b;
@@ -116,7 +116,8 @@
   }
   .scan-icon{width:56px; height:56px;}
   #camWrap{position:relative; border-radius:14px; overflow:hidden; background:#000; margin-bottom:12px;}
-  #camVideo{width:100%; display:block; max-height:56vh; object-fit:cover;}
+  #camContainer{width:100%; min-height:280px; max-height:56vh; position:relative;}
+  #camContainer video, #camContainer canvas{width:100% !important; height:100% !important; position:absolute; top:0; left:0; object-fit:cover;}
   .cam-frame{position:absolute; inset:14%; border:2.5px solid #8fd0bf; border-radius:12px; box-shadow:0 0 0 999px rgba(0,0,0,.28);}
   .cam-hint{position:absolute; bottom:10px; left:0; right:0; text-align:center; color:#fff; font-size:12px; font-weight:600; text-shadow:0 1px 3px rgba(0,0,0,.6);}
 
@@ -286,7 +287,7 @@
     </div>
 
     <div id="camWrap" class="hide">
-      <video id="camVideo" playsinline muted autoplay></video>
+      <div id="camContainer"></div>
       <div class="cam-frame"></div>
       <div class="cam-hint">Đưa mã vạch vào khung hình</div>
     </div>
@@ -327,13 +328,9 @@
         </div>
       </div>
 
-      <div class="stat-grid">
+      <div class="stat-grid" style="grid-template-columns:1fr;">
         <div class="stat">
-          <div class="k">Tồn hệ thống</div>
-          <div class="v" id="pcStock">0</div>
-        </div>
-        <div class="stat">
-          <div class="k">Đã kiểm (tất cả)</div>
+          <div class="k">Đã kiểm (tất cả người kiểm)</div>
           <div class="v" id="pcCounted">0</div>
         </div>
       </div>
@@ -818,7 +815,6 @@
     $("pcCode").textContent = prod.code;
     $("pcName").textContent = prod.name;
     $("pcUnit").textContent = prod.unit || "—";
-    $("pcStock").textContent = fmtNum(prod.stock);
     $("qtyInput").value = 1;
     $("pcNote").value = "";
     $("pcStatusBanner").classList.add("hide");
@@ -845,13 +841,13 @@
     el.classList.remove("hide","status-ok","status-under","status-over");
     if(projectedTotal === prod.stock){
       el.classList.add("status-ok");
-      el.textContent = "✓ Khớp tồn hệ thống (" + fmtNum(prod.stock) + ")";
+      el.textContent = "✓ Đã khớp tồn hệ thống";
     } else if(projectedTotal < prod.stock){
       el.classList.add("status-under");
-      el.textContent = "⚠ Chưa đủ tồn — thiếu " + fmtNum(prod.stock - projectedTotal) + " so với tồn hệ thống (" + fmtNum(prod.stock) + ")";
+      el.textContent = "⚠ Chưa đủ so với tồn hệ thống — kiểm tra lại đã đếm hết chưa";
     } else {
       el.classList.add("status-over");
-      el.textContent = "✕ Vượt số lượng tồn — dư " + fmtNum(projectedTotal - prod.stock) + " so với tồn hệ thống (" + fmtNum(prod.stock) + ")";
+      el.textContent = "✕ Đã vượt tồn hệ thống — kiểm tra lại số lượng vừa nhập";
     }
   }
 
@@ -911,90 +907,65 @@
     if(e.key === "Enter"){ handleScanResult(this.value); }
   });
 
-  /* ================= CAMERA SCAN (ZXing — works on iPhone Safari + Android Chrome) ================= */
-  var zxingReader = null;
-  var zxingControls = null;
-  var camStream = null;
+  /* ================= CAMERA SCAN (Quagga2 — tuned for 1D retail barcodes: EAN/Code128/UPC) ================= */
+  var quaggaRunning = false;
 
-  async function pickRearCameraId(){
-    try{
-      var devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
-      if(!devices.length) return undefined;
-      var back = devices.find(function(d){ return /back|rear|environment/i.test(d.label||""); });
-      return back ? back.deviceId : devices[devices.length-1].deviceId;
-    }catch(e){ return undefined; }
+  function onQuaggaDetected(result){
+    var code = result && result.codeResult && result.codeResult.code;
+    if(!code) return;
+    if(navigator.vibrate) navigator.vibrate(80);
+    closeCamera();
+    handleScanResult(code);
   }
 
-  $("btnOpenCam").addEventListener("click", async function(){
-    try{
-      $("camWrap").classList.remove("hide");
-      $("btnCloseCam").classList.remove("hide");
-      $("scanIdle").classList.add("hide");
+  $("btnOpenCam").addEventListener("click", function(){
+    if(typeof Quagga === "undefined"){
+      toast("Chưa tải được thư viện quét mã (mạng chậm?). Vui lòng tải lại trang và thử lại, hoặc nhập mã tay.", 4000);
+      return;
+    }
+    $("camWrap").classList.remove("hide");
+    $("btnCloseCam").classList.remove("hide");
+    $("scanIdle").classList.add("hide");
 
-      if(!zxingReader){
-        var hints = new Map();
-        hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-          ZXing.BarcodeFormat.EAN_13,
-          ZXing.BarcodeFormat.EAN_8,
-          ZXing.BarcodeFormat.UPC_A,
-          ZXing.BarcodeFormat.UPC_E,
-          ZXing.BarcodeFormat.CODE_128,
-          ZXing.BarcodeFormat.CODE_39,
-          ZXing.BarcodeFormat.ITF,
-          ZXing.BarcodeFormat.QR_CODE
-        ]);
-        hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-        zxingReader = new ZXing.BrowserMultiFormatReader(hints);
-      }
-
-      var constraints = {
-        video: {
-          facingMode: {ideal: "environment"},
-          width: {ideal: 1920},
-          height: {ideal: 1080}
-        }
-      };
-
-      zxingControls = await zxingReader.decodeFromConstraints(constraints, "camVideo", function(result, err){
-        if(result){
-          var val = result.getText();
-          if(navigator.vibrate) navigator.vibrate(80);
-          closeCamera();
-          handleScanResult(val);
-        }
-        // NotFoundException fires on every frame with no code detected — expected noise, ignore it.
-      });
-    }catch(err){
-      console.error(err);
-      // Some browsers reject the ideal 1080p request — retry with default camera constraints.
-      try{
-        var deviceId = await pickRearCameraId();
-        zxingControls = await zxingReader.decodeFromVideoDevice(deviceId, "camVideo", function(result, err2){
-          if(result){
-            var val2 = result.getText();
-            if(navigator.vibrate) navigator.vibrate(80);
-            closeCamera();
-            handleScanResult(val2);
-          }
-        });
-      }catch(err2){
-        console.error(err2);
+    Quagga.init({
+      inputStream: {
+        type: "LiveStream",
+        target: document.querySelector("#camContainer"),
+        constraints: {
+          facingMode: "environment",
+          width: {ideal: 1280},
+          height: {ideal: 720}
+        },
+        area: { top: "20%", right: "8%", left: "8%", bottom: "20%" }
+      },
+      decoder: {
+        readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader","code_39_reader"]
+      },
+      locate: true,
+      locator: { patchSize: "medium", halfSample: true },
+      numOfWorkers: 2,
+      frequency: 10
+    }, function(err){
+      if(err){
+        console.error(err);
         toast("Không thể mở camera. Kiểm tra đã cho phép quyền truy cập camera cho trang này chưa.", 3600);
         closeCamera();
+        return;
       }
-    }
+      Quagga.start();
+      quaggaRunning = true;
+    });
+
+    Quagga.onDetected(onQuaggaDetected);
   });
 
   function closeCamera(){
-    if(zxingControls){
-      try{ zxingControls.stop(); }catch(e){}
-      zxingControls = null;
-    } else if(zxingReader){
-      try{ zxingReader.reset(); }catch(e){}
-    }
-    if(camStream){
-      camStream.getTracks().forEach(function(t){ t.stop(); });
-      camStream = null;
+    if(quaggaRunning){
+      try{
+        Quagga.offDetected(onQuaggaDetected);
+        Quagga.stop();
+      }catch(e){}
+      quaggaRunning = false;
     }
     $("camWrap").classList.add("hide");
     $("btnCloseCam").classList.add("hide");
