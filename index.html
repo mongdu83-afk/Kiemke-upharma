@@ -1338,8 +1338,8 @@
         target: document.querySelector("#camContainer"),
         constraints: {
           facingMode: "environment",
-          width: {ideal: 1280},
-          height: {ideal: 720}
+          width: {ideal: 640},
+          height: {ideal: 480}
         }
         // no "area" crop — scans the full camera frame so aiming is more forgiving
       },
@@ -1347,8 +1347,8 @@
         readers: ["ean_reader","ean_8_reader","code_128_reader","upc_reader","upc_e_reader"]
       },
       locate: true,
-      locator: { patchSize: "large", halfSample: true },
-      numOfWorkers: Math.min(4, (navigator.hardwareConcurrency || 2))
+      locator: { patchSize: "medium", halfSample: false },
+      numOfWorkers: 0 // multi-worker mode fails completely on some devices — single-thread is slower but reliable
     }, function(err){
       if(err){
         console.error(err);
