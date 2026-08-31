@@ -213,6 +213,14 @@
   .empty{text-align:center; padding:40px 16px; color:var(--ink-soft);}
   .empty .em-icon{font-size:34px; margin-bottom:8px;}
 
+  .stat-tile{border-radius:11px; padding:12px 14px; border:1px solid var(--line); background:var(--paper);}
+  .stat-tile .k{font-size:10.5px; color:var(--ink-soft); text-transform:uppercase; letter-spacing:.05em; font-weight:700;}
+  .stat-tile .v{font-size:22px; font-weight:800; margin-top:2px;}
+  .stat-tile.wide{grid-column:1 / -1; display:flex; align-items:center; justify-content:space-between;}
+  .stat-tile.t-ok{background:var(--green-tint); border-color:#bfe3c8;}
+  .stat-tile.t-under{background:var(--amber-tint); border-color:#f0d9a8;}
+  .stat-tile.t-over{background:var(--red-tint); border-color:#f0c7c3;}
+
   /* ---- bottom nav ---- */
   .bottomnav{
     position:fixed; bottom:0; left:0; right:0; z-index:40;
@@ -412,6 +420,7 @@
       <p class="sub">Kết quả cộng dồn từ tất cả người kiểm, theo từng đợt kiểm kê.</p>
       <label class="field-label">Xem đợt kiểm kê</label>
       <select id="summarySessionSelect" style="margin-bottom:12px;"></select>
+      <div id="summaryStats" style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:14px;"></div>
       <div class="sum-toolbar">
         <button class="filter-pill active" data-f="all">Tất cả</button>
         <button class="filter-pill" data-f="counted">Đã kiểm</button>
@@ -435,7 +444,7 @@
 
     <div class="card">
       <h2>File tồn kho cửa hàng</h2>
-      <p class="sub">Tải file Excel tồn kho để làm dữ liệu tham chiếu (mã, tên, ĐVT, tồn). Tải file mới sẽ thay thế file tồn cũ của cửa hàng này — không ảnh hưởng các lần kiểm đã ghi.</p>
+      <p class="sub">Tải file Excel tồn kho để làm dữ liệu tham chiếu (mã, tên, ĐVT, tồn) — file này sẽ gắn riêng cho <b>đợt kiểm kê đang dùng</b> (mỗi đợt/ngày có thể có tồn khác nhau). Nếu file có nhiều dòng cùng mã (do khác lô/hạn dùng), hệ thống tự cộng dồn tồn thành 1 dòng cho mỗi mã. Đợt mới tạo sẽ tạm dùng tồn của đợt gần nhất cho đến khi Phương tải file riêng.</p>
       <input type="file" id="stockFile" accept=".xlsx,.xls,.csv" style="margin-bottom:10px;">
       <button class="btn btn-primary" id="btnUploadStock">Tải lên & xử lý file</button>
       <div id="stockStatus" class="stock-status hide"></div>
@@ -579,42 +588,64 @@
   /* ---------------- Firestore helpers ---------------- */
   var STOCK_CHUNK_SIZE = 1500; // keeps each stock document safely under the 1MB Firestore limit
 
-  // Save a shop's stock reference list, split into chunk documents.
-  async function saveStock(shop, list){
+  function stockMetaId(shop, sessionId){ return shop + "__" + sessionId; }
+  function stockChunkId(shop, sessionId, idx){ return shop + "__" + sessionId + "_" + idx; }
+
+  // Save a stock reference list tied to a specific counting session (each day's tồn snapshot).
+  async function saveStock(shop, sessionId, list){
     var chunks = [];
     for(var i=0;i<list.length;i+=STOCK_CHUNK_SIZE){
       chunks.push(list.slice(i, i+STOCK_CHUNK_SIZE));
     }
-    var metaSnap = await colMeta.doc(shop).get();
+    var metaId = stockMetaId(shop, sessionId);
+    var metaSnap = await colMeta.doc(metaId).get();
     var oldCount = metaSnap.exists ? (metaSnap.data().chunkCount||0) : 0;
 
     var batch = db.batch();
     chunks.forEach(function(chunk, idx){
-      batch.set(colStock.doc(shop+"_"+idx), {items: chunk});
+      batch.set(colStock.doc(stockChunkId(shop, sessionId, idx)), {items: chunk});
     });
     await batch.commit();
 
     if(oldCount > chunks.length){
       var delBatch = db.batch();
       for(var j=chunks.length;j<oldCount;j++){
-        delBatch.delete(colStock.doc(shop+"_"+j));
+        delBatch.delete(colStock.doc(stockChunkId(shop, sessionId, j)));
       }
       await delBatch.commit();
     }
-    await colMeta.doc(shop).set({chunkCount: chunks.length, totalItems: list.length, updatedAt: Date.now()});
+    await colMeta.doc(metaId).set({chunkCount: chunks.length, totalItems: list.length, updatedAt: Date.now()});
     return true;
   }
 
-  async function loadStock(shop){
-    var metaSnap = await colMeta.doc(shop).get();
-    if(!metaSnap.exists) return [];
-    var count = metaSnap.data().chunkCount || 0;
+  async function loadStockChunks(shop, sessionId, count){
     var promises = [];
-    for(var i=0;i<count;i++){ promises.push(colStock.doc(shop+"_"+i).get()); }
+    for(var i=0;i<count;i++){ promises.push(colStock.doc(stockChunkId(shop, sessionId, i)).get()); }
     var snaps = await Promise.all(promises);
     var list = [];
     snaps.forEach(function(s){ if(s.exists){ list = list.concat(s.data().items||[]); } });
     return list;
+  }
+
+  // Loads a session's own tồn snapshot. If that session never had its own file uploaded,
+  // falls back to whichever other session's snapshot for this shop was uploaded most recently —
+  // so a brand-new session isn't empty before its first upload.
+  async function loadStockForSession(shop, sessionId){
+    var metaSnap = await colMeta.doc(stockMetaId(shop, sessionId)).get();
+    if(metaSnap.exists){
+      return await loadStockChunks(shop, sessionId, metaSnap.data().chunkCount||0);
+    }
+    var candidates = [];
+    for(var i=0;i<state.sessions.length;i++){
+      var sid = state.sessions[i].id;
+      if(sid === sessionId) continue;
+      var snap = await colMeta.doc(stockMetaId(shop, sid)).get();
+      if(snap.exists) candidates.push({sessionId: sid, updatedAt: snap.data().updatedAt||0, chunkCount: snap.data().chunkCount||0});
+    }
+    if(!candidates.length) return [];
+    candidates.sort(function(a,b){ return b.updatedAt - a.updatedAt; });
+    var best = candidates[0];
+    return await loadStockChunks(shop, best.sessionId, best.chunkCount);
   }
 
   function entryDocId(shop, sessionId, code){ return shop + "__" + sessionId + "__" + code; }
@@ -760,8 +791,8 @@
     localStorage.setItem("kiemke_lastshop", shop);
     $("gate").classList.add("hide");
     updateCtxChip();
-    await loadStockForShop();
     await loadSessionsForShop();
+    await loadStockForShop();
   });
 
   function updateCtxChip(){
@@ -858,7 +889,7 @@
   /* ================= STOCK LOAD ================= */
   async function loadStockForShop(){
     try{
-      state.stock = await loadStock(state.shop);
+      state.stock = await loadStockForSession(state.shop, state.activeSessionId);
     }catch(e){
       console.error(e);
       state.stock = [];
@@ -948,26 +979,42 @@
     var ui = parseInt($("mapUnit").value,10);
     var si = parseInt($("mapStock").value,10);
     var body = state.stockRaw.body;
-    var list = body.map(function(r){
-      return {
-        code: String(r[ci]||"").trim(),
-        name: String(r[ni]||"").trim(),
-        unit: String(r[ui]||"").trim(),
-        stock: Number(String(r[si]||"0").replace(/[^\d\.\-]/g,"")) || 0
-      };
-    }).filter(function(p){ return p.code; });
+
+    // Group by product code — the source file often has multiple rows per barcode
+    // (same product split across different lô/hạn dùng), so sum their tồn quantities
+    // into a single row instead of keeping duplicates.
+    var grouped = {};
+    var rawRowCount = 0;
+    body.forEach(function(r){
+      var code = String(r[ci]||"").trim();
+      if(!code) return;
+      rawRowCount++;
+      var name = String(r[ni]||"").trim();
+      var unit = String(r[ui]||"").trim();
+      var stockVal = Number(String(r[si]||"0").replace(/[^\d\.\-]/g,"")) || 0;
+      if(!grouped[code]){
+        grouped[code] = {code: code, name: name, unit: unit, stock: 0};
+      }
+      grouped[code].stock += stockVal;
+      // Fill in name/unit if the first occurrence had them blank
+      if(!grouped[code].name && name) grouped[code].name = name;
+      if(!grouped[code].unit && unit) grouped[code].unit = unit;
+    });
+    var list = Object.keys(grouped).map(function(k){ return grouped[k]; });
+    var mergedCount = rawRowCount - list.length;
 
     if(!list.length){ toast("Không có dòng dữ liệu hợp lệ"); return; }
 
     $("btnConfirmMap").textContent = "Đang lưu...";
     try{
-      await saveStock(state.shop, list);
+      await saveStock(state.shop, state.activeSessionId, list);
       state.stock = list;
       $("stockStatus").classList.remove("hide");
-      $("stockStatus").textContent = "✓ Đã lưu " + list.length + " sản phẩm cho cửa hàng " + state.shop;
+      $("stockStatus").textContent = "✓ Đã lưu " + list.length + " sản phẩm cho cửa hàng " + state.shop +
+        (mergedCount > 0 ? " (đã gộp " + fmtNum(mergedCount) + " dòng trùng mã do khác lô/hạn dùng, cộng dồn tồn kho)" : "");
       $("colMapBox").classList.add("hide");
       $("colMapBox").innerHTML = "";
-      toast("Đã cập nhật file tồn kho");
+      toast("Đã cập nhật file tồn kho" + (mergedCount > 0 ? " — đã gộp " + fmtNum(mergedCount) + " dòng trùng mã" : ""));
     }catch(err){
       console.error(err);
       toast("Lưu thất bại, thử lại. Kiểm tra kết nối mạng.");
@@ -1401,26 +1448,91 @@
     list.innerHTML = '<div class="empty"><div class="em-icon">⏳</div>Đang tải dữ liệu...</div>';
     if(!state.stock.length){
       list.innerHTML = '<div class="empty"><div class="em-icon">📄</div>Chưa có file tồn kho cho cửa hàng này.<br>Vào Cài đặt để tải lên.</div>';
+      if($("summaryStats")) $("summaryStats").innerHTML = "";
       return;
     }
     var sessId = state.summarySessionId || state.activeSessionId;
-    var index = await getIndex(sessId);
     var cache = {};
-    for(var i=0;i<index.length;i++){
-      cache[index[i]] = await getEntries(state.shop, sessId, index[i]);
+    var stockByCode = {};
+    state.stock.forEach(function(p){ stockByCode[p.code] = p.stock; }); // baseline: current/active session's tồn
+
+    if(sessId === "__all__"){
+      // Combine every session's counts. For each product, use the tồn snapshot from whichever
+      // session most recently recorded a count for it (tồn giống nhau các kỳ → không đổi gì;
+      // tồn khác nhau → lấy đúng tồn của ngày có số liệu kiểm kê).
+      var sessionsSorted = state.sessions.slice().sort(function(a,b){ return a.createdAt - b.createdAt; }); // oldest → newest
+      var codeLatestSession = {};
+      for(var s=0; s<sessionsSorted.length; s++){
+        var sid = sessionsSorted[s].id;
+        var idx = await getIndex(sid);
+        for(var i=0; i<idx.length; i++){
+          var code = idx[i];
+          var e = await getEntries(state.shop, sid, code);
+          cache[code] = (cache[code] || []).concat(e);
+          codeLatestSession[code] = sid; // overwritten each pass → ends up the most recent session touching this code
+        }
+      }
+      var neededSessions = {};
+      Object.keys(codeLatestSession).forEach(function(code){ neededSessions[codeLatestSession[code]] = true; });
+      var sessionStockCache = {};
+      for(var sid2 in neededSessions){
+        sessionStockCache[sid2] = (sid2 === state.activeSessionId) ? state.stock : await loadStockForSession(state.shop, sid2);
+      }
+      Object.keys(codeLatestSession).forEach(function(code){
+        var sid3 = codeLatestSession[code];
+        var stockList = sessionStockCache[sid3] || [];
+        var found = stockList.find(function(p){ return p.code === code; });
+        if(found) stockByCode[code] = found.stock;
+      });
+    } else {
+      // Viewing one specific session — use that session's own tồn snapshot for every product.
+      if(sessId !== state.activeSessionId){
+        var sessStock = await loadStockForSession(state.shop, sessId);
+        sessStock.forEach(function(p){ stockByCode[p.code] = p.stock; });
+      }
+      var index = await getIndex(sessId);
+      for(var i2=0; i2<index.length; i2++){
+        cache[index[i2]] = await getEntries(state.shop, sessId, index[i2]);
+      }
     }
     state.entriesCache = cache;
+    state.summaryStockByCode = stockByCode;
     renderSummaryFromCache();
+  }
+
+  function renderSummaryStats(rows){
+    var box = $("summaryStats");
+    if(!box) return;
+    var total = rows.length;
+    var counted = rows.filter(function(r){ return r.status!=="none"; }).length;
+    var uncounted = total - counted;
+    var okCount = rows.filter(function(r){ return r.status==="ok"; }).length;
+    var underCount = rows.filter(function(r){ return r.status==="under"; }).length;
+    var overCount = rows.filter(function(r){ return r.status==="over"; }).length;
+    var pct = total ? Math.round(counted/total*100) : 0;
+
+    box.innerHTML =
+      '<div class="stat-tile wide"><div><div class="k">Tiến độ kiểm kê</div><div class="v">'+fmtNum(counted)+' / '+fmtNum(total)+' mã</div></div><div class="v" style="color:var(--teal);">'+pct+'%</div></div>' +
+      '<div class="stat-tile"><div class="k">Đã kiểm</div><div class="v">'+fmtNum(counted)+'</div></div>' +
+      '<div class="stat-tile"><div class="k">Chưa kiểm</div><div class="v">'+fmtNum(uncounted)+'</div></div>' +
+      '<div class="stat-tile t-ok"><div class="k">Khớp tồn</div><div class="v">'+fmtNum(okCount)+'</div></div>' +
+      '<div class="stat-tile t-under"><div class="k">Thiếu tồn</div><div class="v">'+fmtNum(underCount)+'</div></div>' +
+      '<div class="stat-tile t-over" style="grid-column:1 / -1;"><div class="k">Vượt tồn</div><div class="v">'+fmtNum(overCount)+'</div></div>';
   }
 
   function renderSummaryFromCache(){
     var list = $("summaryList");
+    var stockByCode = state.summaryStockByCode || {};
     var rows = state.stock.map(function(p){
       var entries = state.entriesCache[p.code] || [];
       var total = entries.reduce(function(s,e){return s+Number(e.qty||0);},0);
-      var status = entries.length===0 ? "none" : (total===p.stock ? "ok" : (total<p.stock ? "under" : "over"));
-      return {p:p, entries:entries, total:total, status:status};
+      var effectiveStock = stockByCode.hasOwnProperty(p.code) ? stockByCode[p.code] : p.stock;
+      var status = entries.length===0 ? "none" : (total===effectiveStock ? "ok" : (total<effectiveStock ? "under" : "over"));
+      return {p:p, entries:entries, total:total, status:status, stock: effectiveStock};
     });
+
+    state.summaryRows = rows;
+    renderSummaryStats(rows);
 
     var filtered = rows.filter(function(r){
       if(state.summaryFilter==="all") return true;
@@ -1448,9 +1560,9 @@
           '<span class="sum-badge '+b[0]+'">'+b[1]+'</span>' +
         '</div>' +
         '<div class="sr-nums">' +
-          '<div>Tồn hệ thống<br><b>'+fmtNum(r.p.stock)+'</b></div>' +
+          '<div>Tồn hệ thống<br><b>'+fmtNum(r.stock)+'</b></div>' +
           '<div>Đã kiểm<br><b>'+fmtNum(r.total)+'</b></div>' +
-          '<div>Chênh lệch<br><b>'+fmtNum(r.total-r.p.stock)+'</b></div>' +
+          '<div>Chênh lệch<br><b>'+fmtNum(r.total-r.stock)+'</b></div>' +
         '</div>' +
         (r.entries.length ? '<button class="btn btn-ghost btn-sm" style="margin-top:8px;" data-toggle="'+idx+'">Xem chi tiết theo người kiểm</button><div class="sr-detail" id="detail-'+idx+'">'+detailRows+'</div>' : '') +
       '</div>';
@@ -1465,9 +1577,10 @@
 
   /* ================= EXPORT EXCEL ================= */
   $("btnExportExcel").addEventListener("click", function(){
-    var rows = state.stock.map(function(p){
-      var entries = state.entriesCache[p.code] || [];
-      var total = entries.reduce(function(s,e){return s+Number(e.qty||0);},0);
+    var rows = (state.summaryRows || []).map(function(r){
+      var p = r.p;
+      var entries = r.entries;
+      var total = r.total;
       var byUser = {};
       entries.forEach(function(e){ byUser[e.user] = (byUser[e.user]||0) + Number(e.qty||0); });
       var chiTiet = Object.keys(byUser).map(function(u){ return u+": "+byUser[u]; }).join("; ");
@@ -1475,17 +1588,19 @@
         "Mã SP": p.code,
         "Tên SP": p.name,
         "ĐVT": p.unit,
-        "Tồn hệ thống": p.stock,
+        "Tồn hệ thống": r.stock,
         "Đã kiểm": total,
-        "Chênh lệch": total - p.stock,
-        "Trạng thái": entries.length===0 ? "Chưa kiểm" : (total===p.stock ? "Khớp" : (total<p.stock ? "Thiếu" : "Vượt")),
+        "Chênh lệch": total - r.stock,
+        "Trạng thái": entries.length===0 ? "Chưa kiểm" : (total===r.stock ? "Khớp" : (total<r.stock ? "Thiếu" : "Vượt")),
         "Chi tiết theo người kiểm": chiTiet
       };
     });
     var ws = XLSX.utils.json_to_sheet(rows);
     var wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Kiem ke");
-    var fname = "KiemKe_" + state.shop + "_" + new Date().toISOString().slice(0,10) + ".xlsx";
+    var sessLabel = state.summarySessionId === "__all__" ? "TongHopTatCaDot" :
+      ((state.sessions.find(function(s){return s.id===state.summarySessionId;})||{}).label || "").replace(/[^\w]+/g,"") || "Dot";
+    var fname = "KiemKe_" + state.shop + "_" + sessLabel + "_" + new Date().toISOString().slice(0,10) + ".xlsx";
     XLSX.writeFile(wb, fname);
   });
 
@@ -1520,6 +1635,7 @@
           await setActiveSession(state.shop, sid);
           state.activeSessionId = sid;
           state.totalsCache = {};
+          await loadStockForShop();
           updateCtxChip();
           renderSessionManager();
           toast("Đã chuyển sang " + (state.sessions.find(function(s){return s.id===sid;})||{}).label);
@@ -1539,6 +1655,7 @@
           state.activeSessionId = result.activeSessionId;
           state.totalsCache = {};
           state.summarySessionId = result.activeSessionId;
+          await loadStockForShop();
           updateCtxChip();
           renderSessionManager();
           toast("Đã xoá đợt kiểm kê.");
@@ -1557,8 +1674,9 @@
       var result = await createSession(state.shop, label.trim() || undefined);
       state.sessions = result.sessions;
       state.activeSessionId = result.activeSessionId;
-          state.totalsCache = {};
+      state.totalsCache = {};
       state.summarySessionId = result.activeSessionId;
+      await loadStockForShop();
       updateCtxChip();
       renderSessionManager();
       toast("Đã tạo và chuyển sang đợt mới.");
@@ -1570,9 +1688,11 @@
     var sel = $("summarySessionSelect");
     if(!sel) return;
     var sorted = state.sessions.slice().sort(function(a,b){ return b.createdAt - a.createdAt; });
-    sel.innerHTML = sorted.map(function(s){
-      return '<option value="'+s.id+'">'+escapeHtml(s.label)+(s.id===state.activeSessionId ? " (đang dùng)" : "")+'</option>';
-    }).join("");
+    var opts = '<option value="__all__">— Tổng hợp tất cả các đợt —</option>' +
+      sorted.map(function(s){
+        return '<option value="'+s.id+'">'+escapeHtml(s.label)+(s.id===state.activeSessionId ? " (đang dùng)" : "")+'</option>';
+      }).join("");
+    sel.innerHTML = opts;
     sel.value = state.summarySessionId || state.activeSessionId;
   }
   $("summarySessionSelect").addEventListener("change", function(){
