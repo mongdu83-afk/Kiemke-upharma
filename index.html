@@ -7,6 +7,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-storage-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@3/dist/email.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.4/dist/quagga.min.js"></script>
 <style>
   :root{
@@ -431,6 +433,7 @@
     </div>
     <div id="summaryList"></div>
     <button class="btn btn-primary" id="btnExportExcel" style="margin-top:6px;">⬇ Xuất kết quả ra Excel</button>
+    <button class="btn btn-outline" id="btnFinalizeReport" style="margin-top:8px;">📧 Chốt kiểm kê & Gửi biên bản</button>
   </div>
 
   <!-- ============ VIEW: SETTINGS ============ -->
@@ -456,6 +459,13 @@
       <p class="sub">Mỗi đợt lưu số liệu riêng biệt — dùng khi kiểm kê nhiều lần vào các ngày khác nhau. Nhân viên luôn ghi vào đợt đang chọn làm hiện tại.</p>
       <div id="sessionList" style="margin-bottom:12px;"></div>
       <button class="btn btn-primary btn-sm" id="btnNewSession">+ Tạo đợt kiểm kê mới</button>
+    </div>
+
+    <div class="card">
+      <h2>Email nhận biên bản kiểm kê</h2>
+      <p class="sub">Danh sách email các bộ phận liên quan sẽ nhận biên bản khi bấm "Chốt kiểm kê" ở tab Tổng hợp. Nhiều email cách nhau bằng dấu phẩy.</p>
+      <input type="text" id="reportEmailsInput" placeholder="vd: quanly@upharma.vn, ketoan@upharma.vn" style="margin-bottom:10px;">
+      <button class="btn btn-outline btn-sm" id="btnSaveReportEmails">Lưu danh sách email</button>
     </div>
 
     <div class="card" style="background:var(--teal-tint); border-color:#bfe0d6;">
@@ -502,12 +512,24 @@
   };
   firebase.initializeApp(FIREBASE_CONFIG);
   var db = firebase.firestore();
+  var storage = firebase.storage();
   // Separate collections from the dashboard's own data (namespaced with kiemke_ prefix)
   var colMeta = db.collection("kiemke_meta");
   var colStock = db.collection("kiemke_stock");
   var colEntries = db.collection("kiemke_entries");
   var colIndex = db.collection("kiemke_index");
   var colSessions = db.collection("kiemke_sessions");
+  var colSettings = db.collection("kiemke_settings");
+
+  /* ---------------- EmailJS (biên bản kiểm kê tự động) ----------------
+     Điền 3 giá trị này sau khi Phương tạo xong tài khoản EmailJS (Email Services → Service ID,
+     Email Templates → Template ID, Account → API Keys → Public Key), rồi tải lại file lên Netlify. */
+  var EMAILJS_SERVICE_ID = "";
+  var EMAILJS_TEMPLATE_ID = "";
+  var EMAILJS_PUBLIC_KEY = "";
+  if(EMAILJS_PUBLIC_KEY && typeof emailjs !== "undefined"){
+    emailjs.init({publicKey: EMAILJS_PUBLIC_KEY});
+  }
 
   /* ---------------- constants ---------------- */
   var DEFAULT_SHOPS = ["SHOP0058","SHOP0059","SHOP0072","SHOP0074","SHOP0089","SHOP0095","SHOP0121","SHOP0122","SHOP0163"];
@@ -734,6 +756,15 @@
     return {sessions: remaining, activeSessionId: newActive};
   }
 
+  /* ---------------- report recipient list (shared per shop) ---------------- */
+  async function getReportEmails(shop){
+    var snap = await colSettings.doc(shop).get();
+    return snap.exists ? (snap.data().reportEmails || "") : "";
+  }
+  async function saveReportEmails(shop, emails){
+    await colSettings.doc(shop).set({reportEmails: emails, updatedAt: Date.now()}, {merge:true});
+  }
+
   /* ================= GATE ================= */
   function populateShopSelect(){
     var sel = $("gateShop");
@@ -822,7 +853,21 @@
       console.error(e);
       toast("Không tải được đợt kiểm kê. Kiểm tra kết nối mạng.");
     }
+    try{
+      var emails = await getReportEmails(state.shop);
+      $("reportEmailsInput").value = emails;
+    }catch(e){ console.error(e); }
   }
+
+  $("btnSaveReportEmails").addEventListener("click", async function(){
+    var emails = $("reportEmailsInput").value.trim();
+    this.disabled = true;
+    try{
+      await saveReportEmails(state.shop, emails);
+      toast("Đã lưu danh sách email nhận biên bản.");
+    }catch(e){ console.error(e); toast("Lưu thất bại, thử lại."); }
+    this.disabled = false;
+  });
 
   /* ================= CONTINUOUS SCAN MODE TOGGLE ================= */
   state.continuousMode = localStorage.getItem("kiemke_continuous") === "1";
@@ -1465,19 +1510,20 @@
       for(var s=0; s<sessionsSorted.length; s++){
         var sid = sessionsSorted[s].id;
         var idx = await getIndex(sid);
-        for(var i=0; i<idx.length; i++){
-          var code = idx[i];
-          var e = await getEntries(state.shop, sid, code);
-          cache[code] = (cache[code] || []).concat(e);
+        var entriesList = await Promise.all(idx.map(function(code){ return getEntries(state.shop, sid, code); }));
+        idx.forEach(function(code, i){
+          cache[code] = (cache[code] || []).concat(entriesList[i]);
           codeLatestSession[code] = sid; // overwritten each pass → ends up the most recent session touching this code
-        }
+        });
       }
       var neededSessions = {};
       Object.keys(codeLatestSession).forEach(function(code){ neededSessions[codeLatestSession[code]] = true; });
+      var neededSessionIds = Object.keys(neededSessions);
+      var stockLists = await Promise.all(neededSessionIds.map(function(sid2){
+        return (sid2 === state.activeSessionId) ? Promise.resolve(state.stock) : loadStockForSession(state.shop, sid2);
+      }));
       var sessionStockCache = {};
-      for(var sid2 in neededSessions){
-        sessionStockCache[sid2] = (sid2 === state.activeSessionId) ? state.stock : await loadStockForSession(state.shop, sid2);
-      }
+      neededSessionIds.forEach(function(sid2, i){ sessionStockCache[sid2] = stockLists[i]; });
       Object.keys(codeLatestSession).forEach(function(code){
         var sid3 = codeLatestSession[code];
         var stockList = sessionStockCache[sid3] || [];
@@ -1491,9 +1537,8 @@
         sessStock.forEach(function(p){ stockByCode[p.code] = p.stock; });
       }
       var index = await getIndex(sessId);
-      for(var i2=0; i2<index.length; i2++){
-        cache[index[i2]] = await getEntries(state.shop, sessId, index[i2]);
-      }
+      var entriesList2 = await Promise.all(index.map(function(code){ return getEntries(state.shop, sessId, code); }));
+      index.forEach(function(code, i){ cache[code] = entriesList2[i]; });
     }
     state.entriesCache = cache;
     state.summaryStockByCode = stockByCode;
@@ -1576,8 +1621,8 @@
   }
 
   /* ================= EXPORT EXCEL ================= */
-  $("btnExportExcel").addEventListener("click", function(){
-    var rows = (state.summaryRows || []).map(function(r){
+  function buildReportRows(){
+    return (state.summaryRows || []).map(function(r){
       var p = r.p;
       var entries = r.entries;
       var total = r.total;
@@ -1595,13 +1640,99 @@
         "Chi tiết theo người kiểm": chiTiet
       };
     });
+  }
+
+  function currentSessionLabel(){
+    return state.summarySessionId === "__all__" ? "Tổng hợp tất cả các đợt" :
+      ((state.sessions.find(function(s){return s.id===state.summarySessionId;})||{}).label || "Đợt kiểm kê");
+  }
+  function currentSessionLabelSlug(){
+    return state.summarySessionId === "__all__" ? "TongHopTatCaDot" :
+      (currentSessionLabel().replace(/[^\w]+/g,"") || "Dot");
+  }
+
+  function buildReportWorkbookBlob(rows){
     var ws = XLSX.utils.json_to_sheet(rows);
     var wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Kiem ke");
-    var sessLabel = state.summarySessionId === "__all__" ? "TongHopTatCaDot" :
-      ((state.sessions.find(function(s){return s.id===state.summarySessionId;})||{}).label || "").replace(/[^\w]+/g,"") || "Dot";
-    var fname = "KiemKe_" + state.shop + "_" + sessLabel + "_" + new Date().toISOString().slice(0,10) + ".xlsx";
+    var wbout = XLSX.write(wb, {bookType:"xlsx", type:"array"});
+    return new Blob([wbout], {type:"application/octet-stream"});
+  }
+
+  $("btnExportExcel").addEventListener("click", function(){
+    var rows = buildReportRows();
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Kiem ke");
+    var fname = "KiemKe_" + state.shop + "_" + currentSessionLabelSlug() + "_" + new Date().toISOString().slice(0,10) + ".xlsx";
     XLSX.writeFile(wb, fname);
+  });
+
+  /* ================= CHỐT KIỂM KÊ & GỬI BIÊN BẢN QUA EMAIL ================= */
+  $("btnFinalizeReport").addEventListener("click", async function(){
+    var btn = this;
+    if(!state.summaryRows || !state.summaryRows.length){
+      toast("Chưa có dữ liệu tổng hợp. Vào tab Tổng hợp và đợi tải xong trước khi chốt.");
+      return;
+    }
+    if(!EMAILJS_SERVICE_ID || !EMAILJS_TEMPLATE_ID || !EMAILJS_PUBLIC_KEY){
+      toast("Chưa cấu hình EmailJS trong app. Liên hệ người phát triển để hoàn tất kết nối.", 3600);
+      return;
+    }
+    var emails = await getReportEmails(state.shop);
+    if(!emails.trim()){
+      toast("Chưa có email người nhận. Vào Cài đặt để thêm danh sách email.", 3200);
+      return;
+    }
+    if(!confirm("Chốt kiểm kê và gửi biên bản cho: " + emails + " ?")) return;
+
+    btn.disabled = true;
+    btn.textContent = "Đang tạo & gửi...";
+    try{
+      var rows = buildReportRows();
+      var blob = buildReportWorkbookBlob(rows);
+      var sessLabel = currentSessionLabel();
+      var sessSlug = currentSessionLabelSlug();
+      var path = "kiemke_reports/" + state.shop + "/" + Date.now() + "_" + sessSlug + ".xlsx";
+      var storageRef = storage.ref().child(path);
+      await storageRef.put(blob);
+      var reportUrl = await storageRef.getDownloadURL();
+
+      var summaryRows = state.summaryRows;
+      var total = summaryRows.length;
+      var counted = summaryRows.filter(function(r){ return r.status!=="none"; }).length;
+      var okCount = summaryRows.filter(function(r){ return r.status==="ok"; }).length;
+      var underCount = summaryRows.filter(function(r){ return r.status==="under"; }).length;
+      var overCount = summaryRows.filter(function(r){ return r.status==="over"; }).length;
+      var mismatchLines = summaryRows.filter(function(r){ return r.status==="under" || r.status==="over"; })
+        .map(function(r){
+          return r.p.name + " (" + r.p.code + "): tồn " + fmtNum(r.stock) + ", kiểm " + fmtNum(r.total) +
+            " — " + (r.status==="under" ? "thiếu " : "vượt ") + fmtNum(Math.abs(r.total - r.stock));
+        }).join("\n");
+
+      var params = {
+        shop: state.shop,
+        session_label: sessLabel,
+        sent_time: new Date().toLocaleString("vi-VN"),
+        user_name: state.user,
+        total_sku: fmtNum(total),
+        counted_sku: fmtNum(counted),
+        uncounted_sku: fmtNum(total - counted),
+        ok_sku: fmtNum(okCount),
+        under_sku: fmtNum(underCount),
+        over_sku: fmtNum(overCount),
+        mismatch_details: mismatchLines || "Không có mã lệch tồn.",
+        report_url: reportUrl,
+        to_email: emails
+      };
+
+      await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, params);
+      toast("Đã gửi biên bản kiểm kê qua email thành công.", 3000);
+    }catch(err){
+      console.error(err);
+      toast("Gửi thất bại. Kiểm tra kết nối mạng, cấu hình EmailJS, hoặc quyền Storage.", 4000);
+    }
+    btn.disabled = false;
+    btn.textContent = "📧 Chốt kiểm kê & Gửi biên bản";
   });
 
   /* ================= SESSION MANAGER (Cài đặt) ================= */
